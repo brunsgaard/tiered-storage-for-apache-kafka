@@ -150,6 +150,30 @@ class GcsStorageConfigTest {
     }
 
     @Test
+    void apacheTransportRequiresApiCallTimeout() {
+        final var props = Map.of(
+            "gcs.bucket.name", "bucket",
+            "gcs.credentials.default", "true",
+            "gcs.http.transport", "apache"
+        );
+        assertThatThrownBy(() -> new GcsStorageConfig(props))
+            .isInstanceOf(ConfigException.class)
+            .hasMessageContaining("gcs.http.transport=apache requires gcs.operation.timeout");
+    }
+
+    @Test
+    void apacheTransportWithApiCallTimeoutIsValid() {
+        final GcsStorageConfig config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "bucket",
+            "gcs.credentials.default", "true",
+            "gcs.http.transport", "apache",
+            "gcs.operation.timeout", "60000"
+        ));
+        assertThat(config.httpTransport()).isEqualTo("apache");
+        assertThat(config.operationTimeout()).isEqualTo(Duration.ofMillis(60000));
+    }
+
+    @Test
     void resumableUploadChunkSize() {
         final GcsStorageConfig config = new GcsStorageConfig(
             Map.of(

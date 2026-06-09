@@ -28,6 +28,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.aiven.kafka.tieredstorage.storage.BytesRange;
 import io.aiven.kafka.tieredstorage.storage.InvalidRangeException;
@@ -38,6 +39,7 @@ import io.aiven.kafka.tieredstorage.storage.StorageBackendException;
 import io.aiven.kafka.tieredstorage.storage.proxy.ProxyConfig;
 import io.aiven.kafka.tieredstorage.storage.proxy.Socks5ProxyAuthenticator;
 
+import com.google.api.client.http.apache.v2.ApacheHttpTransport;
 import com.google.api.gax.retrying.RetrySettings;
 import com.google.cloud.BaseServiceException;
 import com.google.cloud.ReadChannel;
@@ -46,8 +48,15 @@ import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
+import org.apache.http.impl.client.HttpClientBuilder;
 
 public class GcsStorage implements StorageBackend {
+    // Apache HttpClient connection-pool sizing (total and per-route). PoolingHttpClientConnectionManager
+    // defaults to 20 total / 2 per route, which would serialize concurrent upload/fetch/delete behind
+    // 2 connections to storage.googleapis.com; we bump both well above peak GCS concurrency and leave
+    // slack for in-flight aborts (a connection mid-shutdown doesn't free its slot until close completes).
+    private static final int MAX_HTTP_CONNECTIONS = 50;
+
     private volatile Storage storage;
     private String bucketName;
     private MetricCollector metricCollector;
@@ -56,6 +65,19 @@ public class GcsStorage implements StorageBackend {
     private StorageOptions.Builder storageOptionsBuilder;
     private Duration operationTimeout;
     private ExecutorService operationExecutor;
+
+    // The Apache HttpClient transport, when gcs.http.transport=apache. Built once in configure()
+    // and reused across every Storage client rebuild (the transport is credential-independent, so
+    // it's safe to share). The transport factory below returns this instance rather than minting a
+    // new one per build — otherwise each credentials reload (updateStorageClient) would spawn a new
+    // connection pool that is never shut down, since Storage is not AutoCloseable. Shut down in close().
+    private ApacheHttpTransport apacheTransport;
+
+    // Tracks in-flight Apache requests per worker thread so a bounded call can be force-aborted on
+    // timeout/interruption (see AbortableRequestTracker). Always allocated (cheap); its interceptor
+    // is only wired in when transport=apache, and config validation guarantees that implies
+    // operationTimeout is set, so tracking is always paired with the bounded path that cleans it up.
+    private final AbortableRequestTracker requestTracker = new AbortableRequestTracker();
 
     @Override
     public void configure(final Map<String, ?> configs) {
@@ -73,6 +95,28 @@ public class GcsStorage implements StorageBackend {
                 Socks5ProxyAuthenticator.register(
                     proxyConfig.host(), proxyConfig.port(), proxyConfig.username(), proxyConfig.password());
             }
+        } else if (GcsStorageConfig.GCS_HTTP_TRANSPORT_APACHE.equals(config.httpTransport())) {
+            // Apache HttpClient transport, chosen over the default NetHttpTransport because the
+            // underlying connection can be force-closed via HttpUriRequest.abort() — the lever the
+            // plugin uses on operation-timeout to unblock a worker parked in socketWrite0. The
+            // requestTracker's interceptor registers each in-flight request keyed by the worker
+            // thread that issued it; when operation-timeout fires, runBounded looks the request up by
+            // thread and aborts it, which shuts down the connection and propagates to the parked
+            // write as an IOException so the worker unwinds cleanly.
+            final var httpClient = HttpClientBuilder.create()
+                .useSystemProperties()
+                .addInterceptorFirst(requestTracker.interceptor())
+                // Disable Apache's automatic retry layer (RetryExec). It would catch the
+                // SocketException thrown when we abort() and silently re-issue the request on a
+                // fresh connection, defeating the abort. The GCS SDK has its own retry layer
+                // (controlled via gcs.api.retry.*), so Apache's is redundant and harmful here.
+                .disableAutomaticRetries()
+                .setMaxConnTotal(MAX_HTTP_CONNECTIONS)
+                .setMaxConnPerRoute(MAX_HTTP_CONNECTIONS)
+                .build();
+            // Build the transport once and reuse it for every client rebuild (see field comment).
+            this.apacheTransport = new ApacheHttpTransport(httpClient);
+            httpTransportOptionsBuilder.setHttpTransportFactory(() -> apacheTransport);
         }
 
         metricCollector = new MetricCollector();
@@ -241,11 +285,12 @@ public class GcsStorage implements StorageBackend {
      * action on a daemon-threaded executor and bounds the wait with
      * {@link Future#get(long, TimeUnit)}.
      *
-     * <p>On {@link TimeoutException}, throws {@link StorageBackendException} immediately. The
-     * cancelled task continues running on its worker thread (because {@code socketWrite0} is a
-     * native blocking call that does not honor {@link Thread#interrupt()}), but the caller is
-     * unblocked. The leaked thread completes naturally when the kernel TCP retransmit window
-     * expires.
+     * <p>On {@link TimeoutException}, throws {@link StorageBackendException} immediately and
+     * {@linkplain #cancelWorker cancels the worker}. With {@code gcs.http.transport=apache} the
+     * worker's in-flight request is aborted, so it unblocks promptly; with the default
+     * {@code urlconnection} transport the worker keeps running (because {@code socketWrite0} is a
+     * native blocking call that does not honor {@link Thread#interrupt()}) and completes only when
+     * the kernel TCP retransmit window expires.
      *
      * <p>On {@link ExecutionException}, unwraps and rethrows the underlying
      * {@link StorageBackendException} (or its subclasses {@link KeyNotFoundException} /
@@ -256,11 +301,22 @@ public class GcsStorage implements StorageBackend {
         if (operationExecutor == null) {
             return runDirectly(action, description);
         }
-        final Future<T> future = operationExecutor.submit(action);
+        // Capture the worker thread so the canceller can look up its in-flight Apache request on
+        // timeout. Set inside the lambda (so it's the actual worker, not the submitter), cleared
+        // in finally so activeApacheRequests/cancelledWorkers don't grow.
+        final AtomicReference<Thread> workerRef = new AtomicReference<>();
+        final Future<T> future = operationExecutor.submit(() -> {
+            workerRef.set(Thread.currentThread());
+            try {
+                return action.call();
+            } finally {
+                requestTracker.clear(Thread.currentThread());
+            }
+        });
         try {
             return future.get(operationTimeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (final TimeoutException e) {
-            future.cancel(true);
+            cancelWorker(future, workerRef.get());
             throw new StorageBackendException(
                 "Timed out after " + operationTimeout + " attempting to " + description, e);
         } catch (final ExecutionException e) {
@@ -273,10 +329,29 @@ public class GcsStorage implements StorageBackend {
             }
             throw new StorageBackendException("Failed to " + description, cause);
         } catch (final InterruptedException e) {
-            future.cancel(true);
+            // Same leak as the timeout path: a worker blocked in socketWrite0 won't be unblocked by
+            // cancel(false), so we must abort its in-flight request. Interruption of the calling
+            // thread is routine during RLM task cancellation (partition reassignment, broker
+            // shutdown), so without this the worker + its socket would leak on every such event.
+            cancelWorker(future, workerRef.get());
             Thread.currentThread().interrupt();
             throw new StorageBackendException("Interrupted while attempting to " + description, e);
         }
+    }
+
+    /**
+     * Abort a bounded call's worker and cancel its future. Force-closes the worker's in-flight
+     * Apache request (via {@link AbortableRequestTracker#cancelAndAbort}) so a thread parked in
+     * {@code socketWrite0} unblocks, then cancels the future.
+     *
+     * <p>Always {@code cancel(false)}, never {@code cancel(true)}: interrupting a worker parked in a
+     * {@code java.nio.channels} writable channel makes the JVM's interrupt handler flush the
+     * channel's output buffer onto the SAME blocked socket, parking the canceller alongside the
+     * worker. The abort — not the interrupt — is what unblocks the worker.
+     */
+    private void cancelWorker(final Future<?> future, final Thread worker) {
+        requestTracker.cancelAndAbort(worker);
+        future.cancel(false);
     }
 
     private static <T> T runDirectly(final Callable<T> action, final String description)
@@ -325,6 +400,9 @@ public class GcsStorage implements StorageBackend {
     public void close() throws IOException {
         if (operationExecutor != null) {
             operationExecutor.shutdownNow();
+        }
+        if (apacheTransport != null) {
+            apacheTransport.shutdown();
         }
         if (credentialsProvider != null) {
             credentialsProvider.close();

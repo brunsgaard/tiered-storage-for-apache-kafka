@@ -73,6 +73,20 @@ public class GcsStorageConfig extends AbstractConfig {
             + "0 means unlimited (subject to " + GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG + "). "
             + "When unset, the SDK default applies.";
 
+    static final String GCS_HTTP_TRANSPORT_CONFIG = "gcs.http.transport";
+    static final String GCS_HTTP_TRANSPORT_URLCONNECTION = "urlconnection";
+    static final String GCS_HTTP_TRANSPORT_APACHE = "apache";
+    private static final String GCS_HTTP_TRANSPORT_DOC =
+        "HTTP transport implementation for the GCS client. "
+            + "'" + GCS_HTTP_TRANSPORT_URLCONNECTION + "' (default) uses java.net.HttpURLConnection "
+            + "via google-http-client's NetHttpTransport. "
+            + "'" + GCS_HTTP_TRANSPORT_APACHE + "' uses Apache HttpClient via ApacheHttpTransport, "
+            + "which exposes a per-request abort() that the plugin uses on the gcs.operation.timeout "
+            + "to force-close the underlying socket. With urlconnection, an in-flight write that "
+            + "has filled the kernel send buffer cannot be cancelled mid-flight (the worker thread "
+            + "leaks until the kernel TCP retransmit window expires). With apache, the worker thread "
+            + "is unblocked promptly when the call timeout fires.";
+
     static final String GCS_OPERATION_TIMEOUT_CONFIG = "gcs.operation.timeout";
     private static final String GCS_OPERATION_TIMEOUT_DOC =
         "Hard upper bound in milliseconds on a single plugin-level call to GCS "
@@ -154,6 +168,13 @@ public class GcsStorageConfig extends AbstractConfig {
                 ConfigDef.Importance.LOW,
                 GCS_OPERATION_TIMEOUT_DOC)
             .define(
+                GCS_HTTP_TRANSPORT_CONFIG,
+                ConfigDef.Type.STRING,
+                GCS_HTTP_TRANSPORT_URLCONNECTION,
+                ConfigDef.ValidString.in(GCS_HTTP_TRANSPORT_URLCONNECTION, GCS_HTTP_TRANSPORT_APACHE),
+                ConfigDef.Importance.LOW,
+                GCS_HTTP_TRANSPORT_DOC)
+            .define(
                 GCP_CREDENTIALS_JSON_CONFIG,
                 ConfigDef.Type.PASSWORD,
                 null,
@@ -209,6 +230,19 @@ public class GcsStorageConfig extends AbstractConfig {
                 .replace("defaultCredentials", GCP_CREDENTIALS_DEFAULT_CONFIG);
             throw new ConfigException(message);
         }
+
+        // The Apache transport exists only to make a call bounded by gcs.operation.timeout abortable;
+        // without that timeout its request-tracking interceptor never serves a purpose and just
+        // retains stale per-thread state. Reject the inert combination rather than silently degrading.
+        // (Note: no ordering constraint between call.timeout and write.timeout — the intended use is
+        // often a SHORT call.timeout as a fast abort wall with a longer write.timeout backstop.)
+        if (GCS_HTTP_TRANSPORT_APACHE.equals(getString(GCS_HTTP_TRANSPORT_CONFIG))
+            && getLong(GCS_OPERATION_TIMEOUT_CONFIG) == null) {
+            throw new ConfigException(GCS_HTTP_TRANSPORT_CONFIG + "=" + GCS_HTTP_TRANSPORT_APACHE
+                + " requires " + GCS_OPERATION_TIMEOUT_CONFIG + " to be set; the Apache transport is "
+                + "only useful as the lever that makes a " + GCS_OPERATION_TIMEOUT_CONFIG + "-bounded call "
+                + "abortable.");
+        }
     }
 
     String bucketName() {
@@ -237,6 +271,10 @@ public class GcsStorageConfig extends AbstractConfig {
 
     Duration operationTimeout() {
         return getDurationMillis(GCS_OPERATION_TIMEOUT_CONFIG);
+    }
+
+    String httpTransport() {
+        return getString(GCS_HTTP_TRANSPORT_CONFIG);
     }
 
     private Duration getDurationMillis(final String key) {

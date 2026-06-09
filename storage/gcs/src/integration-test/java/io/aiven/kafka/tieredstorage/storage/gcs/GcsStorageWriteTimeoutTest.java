@@ -18,12 +18,16 @@ package io.aiven.kafka.tieredstorage.storage.gcs;
 
 import java.io.ByteArrayInputStream;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 import io.aiven.kafka.tieredstorage.storage.StorageBackendException;
 import io.aiven.kafka.tieredstorage.storage.TestObjectKey;
@@ -181,6 +185,332 @@ class GcsStorageWriteTimeoutTest {
         assertThat(elapsedMs)
             .as("upload should have timed out near 3000ms; observed %d ms", elapsedMs)
             .isBetween(2_500L, 5_000L);
+    }
+
+    /**
+     * Detect whether a worker thread that ran a cancelled upload is still alive and parked in a
+     * blocking socket syscall. Returns the names of leaked threads (empty if none). Looks for
+     * threads named "gcs-operation*" (set by GcsStorage's executor factory) not present in the
+     * baseline, whose stack contains a write- or read-side blocking I/O frame.
+     *
+     * <p>The stall blocks in {@code socketWrite0}. On some hosts the worker finishes the chunk PUT
+     * body before the call timeout fires and ends up parked reading the response from the
+     * half-open server (parking in {@code Net.poll} because gcs.http.write.timeout sets a
+     * SO_TIMEOUT on the socket). Either way it's the same daemon-thread leak that
+     * {@code Future.cancel(true)} cannot unblock.
+     */
+    private List<String> findLeakedApiCallWorkers(final Set<Long> baselineThreadIds) {
+        final Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
+        return all.entrySet().stream()
+            .filter(e -> e.getKey().getName().startsWith("gcs-operation"))
+            .filter(e -> !baselineThreadIds.contains(e.getKey().getId()))
+            .filter(e -> Arrays.stream(e.getValue()).anyMatch(GcsStorageWriteTimeoutTest::isBlockingSocketFrame))
+            .map(e -> e.getKey().getName() + " @ " + e.getValue()[0])
+            .collect(Collectors.toList());
+    }
+
+    private static boolean isBlockingSocketFrame(final StackTraceElement f) {
+        final String cls = f.getClassName();
+        final String m = f.getMethodName();
+        // Write-side leak (the original case): worker parked in the kernel write path before the
+        // response is even attempted.
+        if ("implWrite".equals(m) || "socketWrite0".equals(m) || "writeContentToOutputStream".equals(m)) {
+            return true;
+        }
+        // Read-side leak: the chunk PUT body flushed before the call timeout fired and the worker
+        // is parked reading the response from the half-open server.
+        if ("implRead".equals(m) || "socketRead0".equals(m)) {
+            return true;
+        }
+        // Lowest-level park frame used by NioSocketImpl when SO_TIMEOUT is set. Catches the case
+        // where upper-stack method names changed between JDK versions.
+        return "sun.nio.ch.Net".equals(cls) && "poll".equals(m);
+    }
+
+    private static Set<Long> snapshotApiCallThreadIds() {
+        return Thread.getAllStackTraces().keySet().stream()
+            .filter(t -> t.getName().startsWith("gcs-operation"))
+            .map(Thread::getId)
+            .collect(Collectors.toSet());
+    }
+
+    @Test
+    void defaultTransportLeaksWorkerOnApiCallTimeout() throws Exception {
+        // Demonstrates the "leaked daemon thread" limitation with the default NetHttpTransport
+        // (java.net.HttpURLConnection): after Future.cancel, the worker is still parked in
+        // socketWrite0 because there is no abort lever for HttpURLConnection.
+        storage = new GcsStorage();
+        storage.configure(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.endpoint.url", server.url(),
+            "gcs.credentials.default", "false",
+            "gcs.http.write.timeout", "60000",      // long — make the leak persist
+            "gcs.operation.timeout", "1500",          // short — fires fast
+            "gcs.api.retry.max.attempts", "1",
+            "gcs.resumable.upload.chunk.size", Integer.toString(CHUNK_SIZE)
+        ));
+
+        final Set<Long> baseline = snapshotApiCallThreadIds();
+
+        assertThatThrownBy(() -> storage.upload(new ByteArrayInputStream(new byte[PAYLOAD_SIZE]),
+                                                new TestObjectKey("leak-default")))
+            .isInstanceOf(StorageBackendException.class)
+            .hasMessageContaining("Timed out");
+
+        assertThat(server.awaitPut(Duration.ofSeconds(5))).isTrue();
+
+        // Poll for up to 2s for the leak to manifest. The worker is not interrupted, so the
+        // kernel-buffered write parks in socketWrite0 / NioSocketImpl.implWrite within tens of ms —
+        // but on slow hosts the worker may take longer to reach the blocked write.
+        List<String> leaked = findLeakedApiCallWorkers(baseline);
+        final long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+        while (leaked.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+            leaked = findLeakedApiCallWorkers(baseline);
+        }
+
+        if (leaked.isEmpty()) {
+            // Diagnostic dump: full stacks of every gcs-operation worker so we can see where the
+            // worker actually is, in case the JDK NIO stack no longer matches the detected frames.
+            final StringBuilder dump = new StringBuilder();
+            Thread.getAllStackTraces().entrySet().stream()
+                .filter(e -> e.getKey().getName().startsWith("gcs-operation"))
+                .forEach(e -> {
+                    dump.append("\n").append(e.getKey().getName())
+                        .append(" state=").append(e.getKey().getState()).append("\n");
+                    Arrays.stream(e.getValue()).limit(60)
+                        .forEach(f -> dump.append("    at ").append(f).append("\n"));
+                });
+            System.err.println("[defaultTransportLeaksWorkerOnApiCallTimeout] "
+                + "leak NOT observed within 2s window. All gcs-operation worker stacks:" + dump);
+        }
+
+        assertThat(leaked)
+            .as("default NetHttpTransport: expected at least one gcs-operation worker still parked"
+                + " in a write syscall after the call timeout fired and Future.cancel ran.")
+            .isNotEmpty();
+    }
+
+    @Test
+    void apacheTransportDoesNotLeakWorkerOnApiCallTimeout() throws Exception {
+        // With gcs.http.transport=apache and the abort-on-timeout plumbing in runBounded: when the
+        // call timeout fires, the canceller calls HttpRequestBase.abort() on the worker's in-flight
+        // request, which shuts down the Apache connection, closes the socket, and propagates to the
+        // parked socketWrite0 as IOException so the worker completes and exits. No leak.
+        storage = new GcsStorage();
+        storage.configure(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.endpoint.url", server.url(),
+            "gcs.credentials.default", "false",
+            "gcs.http.transport", "apache",
+            "gcs.http.write.timeout", "60000",
+            "gcs.operation.timeout", "1500",
+            "gcs.api.retry.max.attempts", "1",
+            "gcs.resumable.upload.chunk.size", Integer.toString(CHUNK_SIZE)
+        ));
+
+        final Set<Long> baseline = snapshotApiCallThreadIds();
+
+        assertThatThrownBy(() -> storage.upload(new ByteArrayInputStream(new byte[PAYLOAD_SIZE]),
+                                                new TestObjectKey("leak-apache")))
+            .isInstanceOf(StorageBackendException.class)
+            .hasMessageContaining("Timed out");
+
+        assertThat(server.awaitPut(Duration.ofSeconds(5))).isTrue();
+
+        // Poll for up to 5s for the leak to clear. If abort() unblocks the worker promptly, this
+        // completes in <100 ms. If the leak persists the full 5s, abort isn't reaching the
+        // in-flight write — dump diagnostics and fail.
+        List<String> leaked = findLeakedApiCallWorkers(baseline);
+        final long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (!leaked.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+            leaked = findLeakedApiCallWorkers(baseline);
+        }
+
+        if (!leaked.isEmpty()) {
+            final StringBuilder dump = new StringBuilder();
+            Thread.getAllStackTraces().entrySet().stream()
+                .filter(e -> e.getKey().getName().startsWith("gcs-operation"))
+                .forEach(e -> {
+                    dump.append("\n").append(e.getKey().getName()).append("\n");
+                    Arrays.stream(e.getValue()).limit(60)
+                        .forEach(f -> dump.append("    at ").append(f).append("\n"));
+                });
+            System.err.println("[apacheTransportDoesNotLeakWorkerOnApiCallTimeout] "
+                + "leak persisted past 5s. Full worker stacks:" + dump);
+        }
+
+        assertThat(leaked)
+            .as("apache transport with abort-on-timeout: expected NO gcs-operation worker still"
+                + " parked in a write syscall after the call timeout. If this fails, the abort"
+                + " plumbing in GcsStorage.runBounded is not reaching the in-flight HttpRequestBase.")
+            .isEmpty();
+    }
+
+    @Test
+    void interruptedCallerAbortsWorkerNoLeak() throws Exception {
+        // The interrupt path of runBounded must abort the in-flight request just like the timeout
+        // path. Interruption of the calling thread is routine during RLM task cancellation
+        // (partition reassignment, broker shutdown). Here operationTimeout is long (60s) so it never
+        // fires — the ONLY thing that unblocks the call is the interrupt — and we assert the inner
+        // gcs-operation worker doesn't leak.
+        storage = new GcsStorage();
+        storage.configure(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.endpoint.url", server.url(),
+            "gcs.credentials.default", "false",
+            "gcs.http.transport", "apache",
+            "gcs.http.write.timeout", "60000",
+            "gcs.operation.timeout", "60000",         // long — interrupt, not timeout, ends the call
+            "gcs.api.retry.max.attempts", "1",
+            "gcs.resumable.upload.chunk.size", Integer.toString(CHUNK_SIZE)
+        ));
+
+        final Set<Long> baseline = snapshotApiCallThreadIds();
+
+        // Run the upload on a worker we can interrupt. The caller blocks in runBounded's
+        // future.get(); cancel(true) interrupts THAT caller thread, surfacing InterruptedException
+        // inside runBounded (not the inner gcs-operation worker, which is parked in socketWrite0).
+        final Future<?> caller = backgroundUploader.submit(() ->
+            storage.upload(new ByteArrayInputStream(new byte[PAYLOAD_SIZE]),
+                           new TestObjectKey("interrupted-caller")));
+
+        assertThat(server.awaitPut(Duration.ofSeconds(5)))
+            .as("inner worker did not reach the chunk PUT within 5s")
+            .isTrue();
+
+        // Interrupt the calling thread → runBounded hits catch(InterruptedException) → must abort
+        // the inner worker's request.
+        caller.cancel(true);
+
+        // The inner gcs-operation worker should unwind promptly once its request is aborted.
+        List<String> leaked = findLeakedApiCallWorkers(baseline);
+        final long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (!leaked.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+            leaked = findLeakedApiCallWorkers(baseline);
+        }
+        assertThat(leaked)
+            .as("interrupt path must abort the in-flight request; found leaked worker(s) %s", leaked)
+            .isEmpty();
+    }
+
+    @Test
+    void cancelledWorkersClearedSoSubsequentUploadIsNotPreAborted() throws Exception {
+        // Regression guard: if cancelledWorkers is not cleared in the runBounded lambda's finally,
+        // a subsequent task that lands on the SAME daemon-pool worker (cached executor reuses
+        // threads) gets pre-aborted by the request interceptor — manifesting as random fast
+        // failures on healthy uploads after any timeout event.
+        //
+        // We trigger two consecutive timeouts on the same GcsStorage. Both target the half-open
+        // stub (so both DO time out), but the second one must take ~operationTimeout — NOT <500ms
+        // (which would mean it was pre-aborted on entry). Same logic exercises the
+        // activeApacheRequests cleanup.
+        storage = new GcsStorage();
+        storage.configure(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.endpoint.url", server.url(),
+            "gcs.credentials.default", "false",
+            "gcs.http.transport", "apache",
+            "gcs.http.write.timeout", "60000",
+            "gcs.operation.timeout", "1500",
+            "gcs.api.retry.max.attempts", "1",
+            "gcs.resumable.upload.chunk.size", Integer.toString(CHUNK_SIZE)
+        ));
+
+        // First upload — stalls, gets cancelled at operationTimeout=1500ms.
+        final long t0 = System.nanoTime();
+        assertThatThrownBy(() -> storage.upload(new ByteArrayInputStream(new byte[PAYLOAD_SIZE]),
+                                                new TestObjectKey("first")))
+            .isInstanceOf(StorageBackendException.class);
+        final long firstElapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        assertThat(firstElapsed).as("first upload should have waited near operationTimeout")
+            .isBetween(1_000L, 5_000L);
+
+        // Second upload — re-runs through the same GcsStorage and (likely) the same worker thread
+        // from the cached pool. If state-machine cleanup is correct, it ALSO waits ~operationTimeout.
+        // If cleanup is broken, the interceptor sees the worker still in cancelledWorkers and
+        // pre-aborts the request, which would short-circuit to ~ms.
+        final long t1 = System.nanoTime();
+        assertThatThrownBy(() -> storage.upload(new ByteArrayInputStream(new byte[PAYLOAD_SIZE]),
+                                                new TestObjectKey("second")))
+            .isInstanceOf(StorageBackendException.class);
+        final long secondElapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1);
+
+        assertThat(secondElapsed)
+            .as("second upload finished suspiciously fast (%d ms); likely the previous timeout left"
+                + " state in cancelledWorkers/activeApacheRequests and the request interceptor"
+                + " pre-aborted on entry. Check the lambda's finally block in runBounded.",
+                secondElapsed)
+            .isGreaterThanOrEqualTo(1_000L);
+        assertThat(secondElapsed).isLessThan(5_000L);
+    }
+
+    @Test
+    void concurrentUploadsAllBoundedAndCleanedUp() throws Exception {
+        // Exercises the ConcurrentMap-backed state machine (activeApacheRequests, cancelledWorkers)
+        // under realistic concurrency: five simultaneous uploads, all stalled, all bounded by
+        // operationTimeout. Every one must throw StorageBackendException, and after the run there
+        // must be no leaked gcs-operation workers.
+        final int parallelism = 5;
+        storage = new GcsStorage();
+        storage.configure(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.endpoint.url", server.url(),
+            "gcs.credentials.default", "false",
+            "gcs.http.transport", "apache",
+            "gcs.http.write.timeout", "60000",
+            "gcs.operation.timeout", "1500",
+            "gcs.api.retry.max.attempts", "1",
+            "gcs.resumable.upload.chunk.size", Integer.toString(CHUNK_SIZE)
+        ));
+
+        final Set<Long> baseline = snapshotApiCallThreadIds();
+        final ExecutorService driver = Executors.newFixedThreadPool(parallelism, r -> {
+            final Thread t = new Thread(r, "concurrent-test-driver");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            final long t0 = System.nanoTime();
+            final List<Future<?>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < parallelism; i++) {
+                final int idx = i;
+                futures.add(driver.submit(() ->
+                    storage.upload(new ByteArrayInputStream(new byte[PAYLOAD_SIZE]),
+                                   new TestObjectKey("concurrent-" + idx))));
+            }
+            // Each upload completes with StorageBackendException; the driver executor surfaces it
+            // via ExecutionException. All 5 completing within a bounded window proves they ran
+            // concurrently (not serialized) and the state machine handled overlapping
+            // cancellations correctly.
+            for (final Future<?> f : futures) {
+                assertThatThrownBy(() -> f.get(10, TimeUnit.SECONDS))
+                    .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                    .hasCauseInstanceOf(StorageBackendException.class);
+            }
+            final long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+
+            // Five concurrent uploads each bounded at 1500ms should finish under ~5s. Serialized,
+            // we'd see ~7.5s; a deadlocked pair would never reach here (Future.get(10s) throws).
+            assertThat(elapsedMs)
+                .as("5 concurrent uploads took %d ms; expected to complete in parallel,"
+                    + " not serialized", elapsedMs)
+                .isLessThan(5_000L);
+
+            // Brief settle, then verify no gcs-operation workers are still parked in a write syscall.
+            Thread.sleep(500);
+            final List<String> leaked = findLeakedApiCallWorkers(baseline);
+            assertThat(leaked)
+                .as("Found %d leaked workers after concurrent stress; the state machine under load"
+                    + " is leaking. Inspect activeApacheRequests/cancelledWorkers cleanup.",
+                    leaked.size())
+                .isEmpty();
+        } finally {
+            driver.shutdownNow();
+            driver.awaitTermination(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test

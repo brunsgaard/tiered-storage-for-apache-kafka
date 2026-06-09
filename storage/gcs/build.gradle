@@ -29,6 +29,13 @@ dependencies {
     }
     implementation "com.fasterxml.jackson.core:jackson-databind:$jacksonVersion"
 
+    // Optional Apache HttpClient transport (gcs.http.transport=apache) for proper request abort
+    // support when gcs.operation.timeout fires. The default NetHttpTransport
+    // (java.net.HttpURLConnection) cannot be cleanly cancelled mid-write. Version is intentionally
+    // omitted: it is managed by the google-cloud-storage BOM so it always matches the
+    // google-http-client core already on the classpath.
+    implementation "com.google.http-client:google-http-client-apache-v2"
+
     implementation project(":commons")
 
     testImplementation(testFixtures(project(":storage:core")))
