@@ -398,18 +398,50 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public void close() throws IOException {
+        // Attempt to release every resource even if an earlier one throws, so a single failing
+        // close() can't strand the others; rethrow the first failure with the rest suppressed.
+        // shutdownNow() does not throw, so it goes first, unguarded.
         if (operationExecutor != null) {
             operationExecutor.shutdownNow();
         }
+        IOException failure = null;
         if (apacheTransport != null) {
-            apacheTransport.shutdown();
+            try {
+                apacheTransport.shutdown();
+            } catch (final IOException e) {
+                failure = addSuppressed(failure, e);
+            }
         }
         if (credentialsProvider != null) {
-            credentialsProvider.close();
+            try {
+                credentialsProvider.close();
+            } catch (final IOException e) {
+                failure = addSuppressed(failure, e);
+            }
         }
         if (metricCollector != null) {
-            metricCollector.close();
+            try {
+                metricCollector.close();
+            } catch (final IOException e) {
+                failure = addSuppressed(failure, e);
+            }
         }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    /**
+     * Accumulate a close() failure: returns {@code next} when it is the first failure, otherwise
+     * attaches {@code next} to {@code first} as a suppressed exception and returns {@code first}.
+     * Package-private for testing.
+     */
+    static IOException addSuppressed(final IOException first, final IOException next) {
+        if (first == null) {
+            return next;
+        }
+        first.addSuppressed(next);
+        return first;
     }
 
     @Override
