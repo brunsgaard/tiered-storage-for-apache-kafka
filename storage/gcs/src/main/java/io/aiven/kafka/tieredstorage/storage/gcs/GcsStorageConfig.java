@@ -73,6 +73,20 @@ public class GcsStorageConfig extends AbstractConfig {
             + "0 means unlimited (subject to " + GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG + "). "
             + "When unset, the SDK default applies.";
 
+    static final String GCS_OPERATION_TIMEOUT_CONFIG = "gcs.operation.timeout";
+    private static final String GCS_OPERATION_TIMEOUT_DOC =
+        "Hard upper bound in milliseconds on a single plugin-level call to GCS "
+            + "(upload, fetch, delete). When set, the call runs on a separate executor "
+            + "and is bounded with Future.get(timeout); on expiry the plugin throws "
+            + "StorageBackendException regardless of what the SDK is doing internally. "
+            + "This is the outermost wall around the SDK's retry layers, which empirically "
+            + "do not always honor " + GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG + " for resumable "
+            + "uploads, giving callers a deterministic time-to-failure when GCS or the network "
+            + "path is misbehaving. The cancelled task continues running on a daemon thread "
+            + "until the kernel TCP retransmit window expires (15+ min on default Linux), so "
+            + "leaked work is bounded but non-zero. When unset, calls run synchronously with no "
+            + "plugin-level bound.";
+
     static final String GCP_CREDENTIALS_JSON_CONFIG = "gcs.credentials.json";
     static final String GCP_CREDENTIALS_PATH_CONFIG = "gcs.credentials.path";
     static final String GCP_CREDENTIALS_DEFAULT_CONFIG = "gcs.credentials.default";
@@ -132,6 +146,13 @@ public class GcsStorageConfig extends AbstractConfig {
                 Null.or(ConfigDef.Range.between(0, Integer.MAX_VALUE)),
                 ConfigDef.Importance.LOW,
                 GCS_API_RETRY_MAX_ATTEMPTS_DOC)
+            .define(
+                GCS_OPERATION_TIMEOUT_CONFIG,
+                ConfigDef.Type.LONG,
+                null,
+                Null.or(ConfigDef.Range.between(1L, Long.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_OPERATION_TIMEOUT_DOC)
             .define(
                 GCP_CREDENTIALS_JSON_CONFIG,
                 ConfigDef.Type.PASSWORD,
@@ -212,6 +233,10 @@ public class GcsStorageConfig extends AbstractConfig {
 
     Integer apiRetryMaxAttempts() {
         return getInt(GCS_API_RETRY_MAX_ATTEMPTS_CONFIG);
+    }
+
+    Duration operationTimeout() {
+        return getDurationMillis(GCS_OPERATION_TIMEOUT_CONFIG);
     }
 
     private Duration getDurationMillis(final String key) {

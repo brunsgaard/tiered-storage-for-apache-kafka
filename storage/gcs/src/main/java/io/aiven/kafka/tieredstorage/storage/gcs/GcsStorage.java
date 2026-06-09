@@ -21,6 +21,13 @@ import java.io.InputStream;
 import java.nio.channels.Channels;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import io.aiven.kafka.tieredstorage.storage.BytesRange;
 import io.aiven.kafka.tieredstorage.storage.InvalidRangeException;
@@ -47,6 +54,8 @@ public class GcsStorage implements StorageBackend {
     private Integer resumableUploadChunkSize;
     private ReloadableCredentialsProvider credentialsProvider;
     private StorageOptions.Builder storageOptionsBuilder;
+    private Duration operationTimeout;
+    private ExecutorService operationExecutor;
 
     @Override
     public void configure(final Map<String, ?> configs) {
@@ -95,6 +104,19 @@ public class GcsStorage implements StorageBackend {
         updateStorageClient(credentialsProvider.getCredentials());
 
         resumableUploadChunkSize = config.resumableUploadChunkSize();
+
+        // Plugin-level hard timeout for upload/fetch/delete. When set, calls run on a
+        // daemon-threaded executor and the calling thread is bounded by Future.get(). This is
+        // the outer wall around the SDK's internal retry layers, which empirically do not always
+        // honor RetrySettings.totalTimeout for resumable uploads.
+        operationTimeout = config.operationTimeout();
+        if (operationTimeout != null) {
+            operationExecutor = Executors.newCachedThreadPool(r -> {
+                final Thread t = new Thread(r, "gcs-operation");
+                t.setDaemon(true);
+                return t;
+            });
+        }
     }
 
     /**
@@ -122,6 +144,10 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public long upload(final InputStream inputStream, final ObjectKey key) throws StorageBackendException {
+        return runBounded(() -> doUpload(inputStream, key), "upload " + key);
+    }
+
+    private long doUpload(final InputStream inputStream, final ObjectKey key) throws StorageBackendException {
         try {
             final BlobInfo blobInfo = BlobInfo.newBuilder(this.bucketName, key.value()).build();
             final Blob blob;
@@ -138,6 +164,13 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public void delete(final ObjectKey key) throws StorageBackendException {
+        runBounded(() -> {
+            doDelete(key);
+            return null;
+        }, "delete " + key);
+    }
+
+    private void doDelete(final ObjectKey key) throws StorageBackendException {
         try {
             storage.delete(this.bucketName, key.value());
         } catch (final BaseServiceException e) {
@@ -147,6 +180,10 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public InputStream fetch(final ObjectKey key) throws StorageBackendException {
+        return runBounded(() -> doFetch(key), "fetch " + key);
+    }
+
+    private InputStream doFetch(final ObjectKey key) throws StorageBackendException {
         try {
             final Blob blob = getBlob(key);
             final ReadChannel reader = blob.reader();
@@ -163,6 +200,10 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public InputStream fetch(final ObjectKey key, final BytesRange range) throws StorageBackendException {
+        return runBounded(() -> doFetchRange(key, range), "fetch " + key + " range=" + range);
+    }
+
+    private InputStream doFetchRange(final ObjectKey key, final BytesRange range) throws StorageBackendException {
         try {
             if (range.isEmpty()) {
                 return InputStream.nullInputStream();
@@ -191,6 +232,63 @@ public class GcsStorage implements StorageBackend {
             } else {
                 throw new StorageBackendException("Failed to fetch " + key, e);
             }
+        }
+    }
+
+    /**
+     * Bounded wrapper around an SDK call. When {@link #operationTimeout} is null, runs the action
+     * synchronously on the calling thread (no overhead, no behavior change). When set, runs the
+     * action on a daemon-threaded executor and bounds the wait with
+     * {@link Future#get(long, TimeUnit)}.
+     *
+     * <p>On {@link TimeoutException}, throws {@link StorageBackendException} immediately. The
+     * cancelled task continues running on its worker thread (because {@code socketWrite0} is a
+     * native blocking call that does not honor {@link Thread#interrupt()}), but the caller is
+     * unblocked. The leaked thread completes naturally when the kernel TCP retransmit window
+     * expires.
+     *
+     * <p>On {@link ExecutionException}, unwraps and rethrows the underlying
+     * {@link StorageBackendException} (or its subclasses {@link KeyNotFoundException} /
+     * {@link InvalidRangeException}) so the call's exception contract is preserved.
+     */
+    private <T> T runBounded(final Callable<T> action, final String description)
+        throws StorageBackendException {
+        if (operationExecutor == null) {
+            return runDirectly(action, description);
+        }
+        final Future<T> future = operationExecutor.submit(action);
+        try {
+            return future.get(operationTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (final TimeoutException e) {
+            future.cancel(true);
+            throw new StorageBackendException(
+                "Timed out after " + operationTimeout + " attempting to " + description, e);
+        } catch (final ExecutionException e) {
+            final Throwable cause = e.getCause();
+            if (cause instanceof StorageBackendException) {
+                throw (StorageBackendException) cause;
+            }
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new StorageBackendException("Failed to " + description, cause);
+        } catch (final InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new StorageBackendException("Interrupted while attempting to " + description, e);
+        }
+    }
+
+    private static <T> T runDirectly(final Callable<T> action, final String description)
+        throws StorageBackendException {
+        try {
+            return action.call();
+        } catch (final StorageBackendException e) {
+            throw e;
+        } catch (final RuntimeException e) {
+            throw e;
+        } catch (final Exception e) {
+            throw new StorageBackendException("Failed to " + description, e);
         }
     }
 
@@ -225,6 +323,9 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public void close() throws IOException {
+        if (operationExecutor != null) {
+            operationExecutor.shutdownNow();
+        }
         if (credentialsProvider != null) {
             credentialsProvider.close();
         }

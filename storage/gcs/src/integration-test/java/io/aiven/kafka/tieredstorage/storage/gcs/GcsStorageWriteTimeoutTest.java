@@ -146,6 +146,44 @@ class GcsStorageWriteTimeoutTest {
     }
 
     @Test
+    void operationTimeoutBoundsTotalUploadDuration() throws Exception {
+        // The plugin-level hard wall. With this set, the total time spent inside
+        // GcsStorage.upload() is bounded regardless of how many internal SDK retry layers loop.
+        // Compare to writeTimeoutFiresOnStalledChunkPut (~25s observed) — with operationTimeout=3000
+        // the same stalled upload should fail in ~3s.
+        storage = new GcsStorage();
+        storage.configure(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.endpoint.url", server.url(),
+            "gcs.credentials.default", "false",
+            "gcs.http.write.timeout", "1500",
+            "gcs.api.retry.max.attempts", "1",
+            "gcs.operation.timeout", "3000",
+            "gcs.resumable.upload.chunk.size", Integer.toString(CHUNK_SIZE)
+        ));
+
+        final byte[] payload = new byte[PAYLOAD_SIZE];
+        final long t0 = System.nanoTime();
+
+        assertThatThrownBy(() -> storage.upload(new ByteArrayInputStream(payload),
+                                                new TestObjectKey("stalled-key-3")))
+            .isInstanceOf(StorageBackendException.class)
+            .hasMessageContainingAll("Timed out", "PT3S", "upload");
+
+        final long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+
+        assertThat(server.awaitPut(Duration.ofSeconds(5)))
+            .as("PUT was not received within 5s")
+            .isTrue();
+
+        // The whole point: this should fail near operationTimeout, well below the ~25s we'd see
+        // without it. Generous 1.5s upper slack for executor scheduling and the cancel handshake.
+        assertThat(elapsedMs)
+            .as("upload should have timed out near 3000ms; observed %d ms", elapsedMs)
+            .isBetween(2_500L, 5_000L);
+    }
+
+    @Test
     void withoutWriteTimeoutUploadHangsBeyondShortBudget() throws Exception {
         // Same fixture, but DO NOT set gcs.http.write.timeout. Cap SDK retries so the test can
         // prove the upload blocks, not that retries amplify it.

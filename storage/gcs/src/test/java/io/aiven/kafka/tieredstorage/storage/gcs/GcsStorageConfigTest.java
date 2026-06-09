@@ -51,6 +51,7 @@ class GcsStorageConfigTest {
         assertThat(config.httpWriteTimeout()).isNull();
         assertThat(config.apiRetryTotalTimeout()).isNull();
         assertThat(config.apiRetryMaxAttempts()).isNull();
+        assertThat(config.operationTimeout()).isNull();
 
         final GoogleCredentials mockCredentials = GoogleCredentials.newBuilder().build();
         try (final MockedStatic<GoogleCredentials> googleCredentialsMockedStatic =
@@ -309,5 +310,25 @@ class GcsStorageConfigTest {
             "gcs.api.retry.max.attempts", "-1"
         ))).isInstanceOf(ConfigException.class)
            .hasMessageContaining("gcs.api.retry.max.attempts");
+    }
+
+    @Test
+    void operationTimeoutAccepted() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.operation.timeout", "120000"
+        ));
+        assertThat(config.operationTimeout()).isEqualTo(Duration.ofMillis(120_000));
+    }
+
+    @Test
+    void operationTimeoutRejectsNonPositive() {
+        assertThatThrownBy(() -> new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.operation.timeout", "0"
+        ))).isInstanceOf(ConfigException.class)
+           .hasMessageContaining("gcs.operation.timeout");
     }
 }
