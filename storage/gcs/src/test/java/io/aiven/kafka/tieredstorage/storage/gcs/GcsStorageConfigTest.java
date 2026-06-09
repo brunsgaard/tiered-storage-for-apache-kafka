@@ -16,6 +16,7 @@
 
 package io.aiven.kafka.tieredstorage.storage.gcs;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -47,6 +48,11 @@ class GcsStorageConfigTest {
         assertThat(config.bucketName()).isEqualTo(bucketName);
         assertThat(config.endpointUrl()).isNull();
         assertThat(config.resumableUploadChunkSize()).isEqualTo(25 * 1024 * 1024);
+        assertThat(config.httpWriteTimeout()).isNull();
+        assertThat(config.httpReadTimeout()).isNull();
+        assertThat(config.httpConnectTimeout()).isNull();
+        assertThat(config.apiRetryTotalTimeout()).isNull();
+        assertThat(config.apiRetryMaxAttempts()).isNull();
 
         final GoogleCredentials mockCredentials = GoogleCredentials.newBuilder().build();
         try (final MockedStatic<GoogleCredentials> googleCredentialsMockedStatic =
@@ -81,6 +87,37 @@ class GcsStorageConfigTest {
         assertThatThrownBy(() -> new GcsStorageConfig(Map.of("gcs.bucket.name", "")))
             .isInstanceOf(ConfigException.class)
             .hasMessage("Invalid value  for configuration gcs.bucket.name: String must be non-empty");
+    }
+
+    @Test
+    void httpReadAndConnectTimeoutAreParsed() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true",
+            "gcs.http.read.timeout", "30000",
+            "gcs.http.connect.timeout", "10000"));
+        assertThat(config.httpReadTimeout()).isEqualTo(Duration.ofMillis(30000));
+        assertThat(config.httpConnectTimeout()).isEqualTo(Duration.ofMillis(10000));
+    }
+
+    @Test
+    void httpReadTimeoutBelowRangeRejected() {
+        final var props = Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.http.read.timeout", "0");
+        assertThatThrownBy(() -> new GcsStorageConfig(props))
+            .isInstanceOf(ConfigException.class)
+            .hasMessageContaining("gcs.http.read.timeout");
+    }
+
+    @Test
+    void httpConnectTimeoutAboveRangeRejected() {
+        final var props = Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.http.connect.timeout", Long.toString((long) Integer.MAX_VALUE + 1L));
+        assertThatThrownBy(() -> new GcsStorageConfig(props))
+            .isInstanceOf(ConfigException.class)
+            .hasMessageContaining("gcs.http.connect.timeout");
     }
 
     @Test
@@ -217,5 +254,93 @@ class GcsStorageConfigTest {
         } catch (final Exception e) {
             // Close may throw IOException
         }
+    }
+
+    @Test
+    void httpWriteTimeoutAccepted() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.http.write.timeout", "60000"
+        ));
+        assertThat(config.httpWriteTimeout()).isEqualTo(Duration.ofMillis(60_000));
+    }
+
+    @Test
+    void httpWriteTimeoutRejectsNonPositive() {
+        assertThatThrownBy(() -> new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.http.write.timeout", "0"
+        ))).isInstanceOf(ConfigException.class)
+           .hasMessageContaining("gcs.http.write.timeout");
+
+        assertThatThrownBy(() -> new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.http.write.timeout", "-1"
+        ))).isInstanceOf(ConfigException.class)
+           .hasMessageContaining("gcs.http.write.timeout");
+    }
+
+    @Test
+    void httpWriteTimeoutRejectsAboveIntMax() {
+        assertThatThrownBy(() -> new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.http.write.timeout", Long.toString((long) Integer.MAX_VALUE + 1)
+        ))).isInstanceOf(ConfigException.class)
+           .hasMessageContaining("gcs.http.write.timeout");
+    }
+
+    @Test
+    void apiRetryTotalTimeoutAccepted() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.api.retry.total.timeout", "300000"
+        ));
+        assertThat(config.apiRetryTotalTimeout()).isEqualTo(Duration.ofMillis(300_000));
+    }
+
+    @Test
+    void apiRetryTotalTimeoutRejectsNonPositive() {
+        assertThatThrownBy(() -> new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.api.retry.total.timeout", "0"
+        ))).isInstanceOf(ConfigException.class)
+           .hasMessageContaining("gcs.api.retry.total.timeout");
+    }
+
+    @Test
+    void apiRetryMaxAttemptsAccepted() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.api.retry.max.attempts", "5"
+        ));
+        assertThat(config.apiRetryMaxAttempts()).isEqualTo(5);
+    }
+
+    @Test
+    void apiRetryMaxAttemptsAcceptsZero() {
+        // 0 means unlimited per gax semantics; we forward as-is.
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.api.retry.max.attempts", "0"
+        ));
+        assertThat(config.apiRetryMaxAttempts()).isEqualTo(0);
+    }
+
+    @Test
+    void apiRetryMaxAttemptsRejectsNegative() {
+        assertThatThrownBy(() -> new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "test-bucket",
+            "gcs.credentials.default", "true",
+            "gcs.api.retry.max.attempts", "-1"
+        ))).isInstanceOf(ConfigException.class)
+           .hasMessageContaining("gcs.api.retry.max.attempts");
     }
 }

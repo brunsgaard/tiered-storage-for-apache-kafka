@@ -18,6 +18,7 @@ package io.aiven.kafka.tieredstorage.storage.gcs;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -170,7 +171,20 @@ public class MetricCollector implements Closeable {
         }
     }
 
-    HttpTransportOptions httpTransportOptions(final HttpTransportOptions.Builder builder) {
+    HttpTransportOptions httpTransportOptions(final HttpTransportOptions.Builder builder,
+                                              final Duration writeTimeout,
+                                              final Duration readTimeout,
+                                              final Duration connectTimeout) {
+        // A null timeout means "do not override"; the value the super initializer already applied
+        // (the SDK/transport default) is left in place. When set, each value is applied per-request
+        // so it covers every request the SDK issues, including the media-download GETs backing
+        // fetch()'s lazily-read stream — which gcs.operation.timeout does not reach.
+        //   - writeTimeout  -> bounds the request body write (HttpRequest default 0 = unbounded).
+        //   - readTimeout   -> socket SO_TIMEOUT: per-read inactivity bound on the response body.
+        //   - connectTimeout-> bounds establishing the TCP connection.
+        final int writeTimeoutMs = toMillisOrUnset(writeTimeout);
+        final int readTimeoutMs = toMillisOrUnset(readTimeout);
+        final int connectTimeoutMs = toMillisOrUnset(connectTimeout);
         return new HttpTransportOptions(builder) {
             @Override
             public HttpRequestInitializer getHttpRequestInitializer(final ServiceOptions<?, ?> serviceOptions) {
@@ -178,9 +192,22 @@ public class MetricCollector implements Closeable {
                 return request -> {
                     superInitializer.initialize(request);
                     request.setResponseInterceptor(metricResponseInterceptor);
+                    if (writeTimeoutMs >= 0) {
+                        request.setWriteTimeout(writeTimeoutMs);
+                    }
+                    if (readTimeoutMs >= 0) {
+                        request.setReadTimeout(readTimeoutMs);
+                    }
+                    if (connectTimeoutMs >= 0) {
+                        request.setConnectTimeout(connectTimeoutMs);
+                    }
                 };
             }
         };
+    }
+
+    private static int toMillisOrUnset(final Duration timeout) {
+        return timeout != null ? Math.toIntExact(timeout.toMillis()) : -1;
     }
 
     @Override
