@@ -476,12 +476,28 @@ GcsStorageConfig
   * Valid Values: null or [1,...,2147483647]
   * Importance: low
 
+``gcs.http.transport``
+  HTTP transport implementation for the GCS client. 'urlconnection' (default) uses java.net.HttpURLConnection via google-http-client's NetHttpTransport. 'apache' uses Apache HttpClient via ApacheHttpTransport, which exposes a per-request abort() that the plugin uses on the gcs.operation.timeout to force-close the underlying socket. With urlconnection, an in-flight write that has filled the kernel send buffer cannot be cancelled mid-flight (the worker thread leaks until the kernel TCP retransmit window expires). With apache, the worker thread is unblocked promptly when the call timeout fires.
+
+  * Type: string
+  * Default: urlconnection
+  * Valid Values: [urlconnection, apache]
+  * Importance: low
+
 ``gcs.http.write.timeout``
   Timeout in milliseconds for writing the request body to GCS, applied to every HTTP request issued by the underlying transport. Bounds chunk PUT writes during resumable upload. Without this setting, a half-open TCP connection can block the upload thread until the kernel TCP retransmit window expires (15+ minutes on default Linux), because java.net.HttpURLConnection has no socket-level write timeout. When set, google-http-client bounds each write and throws IOException on expiry, allowing the SDK to retry or surface the error. When unset, no write timeout is applied.
 
   * Type: long
   * Default: null
   * Valid Values: null or [1,...,2147483647]
+  * Importance: low
+
+``gcs.operation.timeout``
+  Hard upper bound in milliseconds on a single plugin-level call to GCS (upload, fetch, delete). When set, the call runs on a separate executor and is bounded with Future.get(timeout); on expiry the plugin throws StorageBackendException regardless of what the SDK is doing internally. This is the outermost wall around the SDK's retry layers, which empirically do not always honor gcs.api.retry.total.timeout for resumable uploads, giving callers a deterministic time-to-failure when GCS or the network path is misbehaving. On expiry the in-flight request is aborted via the required apache transport (which force-closes the socket), so the worker thread unwinds promptly instead of leaking. When unset, calls run synchronously with no plugin-level bound.
+
+  * Type: long
+  * Default: null
+  * Valid Values: null or [1,...,9223372036854775807]
   * Importance: low
 
 
