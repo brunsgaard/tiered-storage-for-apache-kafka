@@ -19,6 +19,7 @@ package io.aiven.kafka.tieredstorage.storage.gcs;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;
+import java.time.Duration;
 import java.util.Map;
 
 import io.aiven.kafka.tieredstorage.storage.BytesRange;
@@ -30,6 +31,7 @@ import io.aiven.kafka.tieredstorage.storage.StorageBackendException;
 import io.aiven.kafka.tieredstorage.storage.proxy.ProxyConfig;
 import io.aiven.kafka.tieredstorage.storage.proxy.Socks5ProxyAuthenticator;
 
+import com.google.api.gax.retrying.RetrySettings;
 import com.google.cloud.BaseServiceException;
 import com.google.cloud.ReadChannel;
 import com.google.cloud.http.HttpTransportOptions;
@@ -69,11 +71,21 @@ public class GcsStorage implements StorageBackend {
         // Create reloadable credentials provider
         this.credentialsProvider = config.reloadableCredentials();
 
-        // Store the builder template for recreating storage clients
+        // Store the builder template for recreating storage clients. The write timeout and
+        // retry settings are set on the template (not on the per-call client) so they are
+        // preserved when the client is rebuilt on a credentials reload.
         this.storageOptionsBuilder = StorageOptions.newBuilder()
-            .setTransportOptions(metricCollector.httpTransportOptions(httpTransportOptionsBuilder));
+            .setTransportOptions(metricCollector.httpTransportOptions(
+                httpTransportOptionsBuilder, config.httpWriteTimeout()));
         if (config.endpointUrl() != null) {
             this.storageOptionsBuilder.setHost(config.endpointUrl());
+        }
+
+        final RetrySettings retrySettings = buildRetrySettings(
+            config.apiRetryTotalTimeout(),
+            config.apiRetryMaxAttempts());
+        if (retrySettings != null) {
+            this.storageOptionsBuilder.setRetrySettings(retrySettings);
         }
 
         // Set up credentials reload callback to recreate storage client
@@ -83,6 +95,29 @@ public class GcsStorage implements StorageBackend {
         updateStorageClient(credentialsProvider.getCredentials());
 
         resumableUploadChunkSize = config.resumableUploadChunkSize();
+    }
+
+    /**
+     * Build a {@link RetrySettings} on top of the SDK defaults, overriding only the fields the
+     * user actually configured. Returns {@code null} when neither override is set, so the SDK
+     * default is left untouched.
+     *
+     * <p>Package-private (rather than private) so {@code GcsStorageRetrySettingsTest} can verify
+     * the override semantics directly; the one-line {@code setRetrySettings} call site in
+     * {@link #configure} is too trivial to test independently.
+     */
+    static RetrySettings buildRetrySettings(final Duration totalTimeout, final Integer maxAttempts) {
+        if (totalTimeout == null && maxAttempts == null) {
+            return null;
+        }
+        final RetrySettings.Builder retryBuilder = StorageOptions.getDefaultRetrySettings().toBuilder();
+        if (totalTimeout != null) {
+            retryBuilder.setTotalTimeoutDuration(totalTimeout);
+        }
+        if (maxAttempts != null) {
+            retryBuilder.setMaxAttempts(maxAttempts);
+        }
+        return retryBuilder.build();
     }
 
     @Override

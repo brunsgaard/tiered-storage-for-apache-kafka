@@ -18,6 +18,7 @@ package io.aiven.kafka.tieredstorage.storage.gcs;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -170,7 +171,14 @@ public class MetricCollector implements Closeable {
         }
     }
 
-    HttpTransportOptions httpTransportOptions(final HttpTransportOptions.Builder builder) {
+    HttpTransportOptions httpTransportOptions(final HttpTransportOptions.Builder builder,
+                                              final Duration writeTimeout) {
+        // A null writeTimeout means "do not call setWriteTimeout"; the HttpRequest default
+        // (0 = unbounded for NetHttpTransport) is left in place. When writeTimeout is set,
+        // NetHttpRequest bounds the body write and throws IOException on expiry.
+        final int writeTimeoutMs = writeTimeout != null
+            ? Math.toIntExact(writeTimeout.toMillis())
+            : -1;
         return new HttpTransportOptions(builder) {
             @Override
             public HttpRequestInitializer getHttpRequestInitializer(final ServiceOptions<?, ?> serviceOptions) {
@@ -178,6 +186,9 @@ public class MetricCollector implements Closeable {
                 return request -> {
                     superInitializer.initialize(request);
                     request.setResponseInterceptor(metricResponseInterceptor);
+                    if (writeTimeoutMs >= 0) {
+                        request.setWriteTimeout(writeTimeoutMs);
+                    }
                 };
             }
         };

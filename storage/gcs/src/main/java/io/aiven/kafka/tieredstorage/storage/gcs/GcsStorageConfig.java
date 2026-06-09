@@ -17,6 +17,7 @@
 package io.aiven.kafka.tieredstorage.storage.gcs;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Map;
 
 import org.apache.kafka.common.config.AbstractConfig;
@@ -25,6 +26,7 @@ import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.config.types.Password;
 
 import io.aiven.kafka.tieredstorage.config.validators.NonEmptyPassword;
+import io.aiven.kafka.tieredstorage.config.validators.Null;
 import io.aiven.kafka.tieredstorage.config.validators.ValidUrl;
 import io.aiven.kafka.tieredstorage.storage.proxy.ProxyConfig;
 
@@ -46,6 +48,30 @@ public class GcsStorageConfig extends AbstractConfig {
         + "The higher the chunk size, the more memory is needed to buffer the chunk.";
     static final int GCS_RESUMABLE_UPLOAD_CHUNK_SIZE_DEFAULT = 25 * 1024 * 1024; // 25MiB
 
+    static final String GCS_HTTP_WRITE_TIMEOUT_CONFIG = "gcs.http.write.timeout";
+    private static final String GCS_HTTP_WRITE_TIMEOUT_DOC =
+        "Timeout in milliseconds for writing the request body to GCS, applied to every "
+            + "HTTP request issued by the underlying transport. Bounds chunk PUT writes during "
+            + "resumable upload. Without this setting, a half-open TCP connection can block the "
+            + "upload thread until the kernel TCP retransmit window expires (15+ minutes on "
+            + "default Linux), because java.net.HttpURLConnection has no socket-level write "
+            + "timeout. When set, google-http-client bounds each write and throws IOException on "
+            + "expiry, allowing the SDK to retry or surface the error. When unset, no write "
+            + "timeout is applied.";
+
+    static final String GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG = "gcs.api.retry.total.timeout";
+    private static final String GCS_API_RETRY_TOTAL_TIMEOUT_DOC =
+        "Total timeout in milliseconds for a single GCS API call across retries, overriding "
+            + "the SDK default. Bounds the cumulative time spent inside StorageOptions retry "
+            + "loops (e.g. resumable upload chunk PUT retries). Combine with "
+            + GCS_HTTP_WRITE_TIMEOUT_CONFIG + " to prevent indefinite retry-then-block cycles "
+            + "during sustained network breakage. When unset, the SDK default applies.";
+
+    static final String GCS_API_RETRY_MAX_ATTEMPTS_CONFIG = "gcs.api.retry.max.attempts";
+    private static final String GCS_API_RETRY_MAX_ATTEMPTS_DOC =
+        "Maximum number of attempts for a single GCS API call, overriding the SDK default. "
+            + "0 means unlimited (subject to " + GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG + "). "
+            + "When unset, the SDK default applies.";
 
     static final String GCP_CREDENTIALS_JSON_CONFIG = "gcs.credentials.json";
     static final String GCP_CREDENTIALS_PATH_CONFIG = "gcs.credentials.path";
@@ -85,6 +111,27 @@ public class GcsStorageConfig extends AbstractConfig {
                 new ResumableUploadChunkSizeValidator(),
                 ConfigDef.Importance.MEDIUM,
                 GCS_RESUMABLE_UPLOAD_CHUNK_SIZE_DOC)
+            .define(
+                GCS_HTTP_WRITE_TIMEOUT_CONFIG,
+                ConfigDef.Type.LONG,
+                null,
+                Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_HTTP_WRITE_TIMEOUT_DOC)
+            .define(
+                GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG,
+                ConfigDef.Type.LONG,
+                null,
+                Null.or(ConfigDef.Range.between(1L, Long.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_API_RETRY_TOTAL_TIMEOUT_DOC)
+            .define(
+                GCS_API_RETRY_MAX_ATTEMPTS_CONFIG,
+                ConfigDef.Type.INT,
+                null,
+                Null.or(ConfigDef.Range.between(0, Integer.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_API_RETRY_MAX_ATTEMPTS_DOC)
             .define(
                 GCP_CREDENTIALS_JSON_CONFIG,
                 ConfigDef.Type.PASSWORD,
@@ -153,6 +200,23 @@ public class GcsStorageConfig extends AbstractConfig {
 
     Integer resumableUploadChunkSize() {
         return getInt(GCS_RESUMABLE_UPLOAD_CHUNK_SIZE_CONFIG);
+    }
+
+    Duration httpWriteTimeout() {
+        return getDurationMillis(GCS_HTTP_WRITE_TIMEOUT_CONFIG);
+    }
+
+    Duration apiRetryTotalTimeout() {
+        return getDurationMillis(GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG);
+    }
+
+    Integer apiRetryMaxAttempts() {
+        return getInt(GCS_API_RETRY_MAX_ATTEMPTS_CONFIG);
+    }
+
+    private Duration getDurationMillis(final String key) {
+        final Long value = getLong(key);
+        return value == null ? null : Duration.ofMillis(value);
     }
 
     /**
