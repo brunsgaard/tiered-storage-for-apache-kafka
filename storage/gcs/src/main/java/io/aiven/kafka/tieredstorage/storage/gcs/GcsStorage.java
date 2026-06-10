@@ -24,8 +24,11 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -57,6 +60,15 @@ public class GcsStorage implements StorageBackend {
     // slack for in-flight aborts (a connection mid-shutdown doesn't free its slot until close completes).
     private static final int MAX_HTTP_CONNECTIONS = 50;
 
+    // Upper bound on threads in the operation executor (i.e. concurrent bounded GCS calls). This is
+    // a safety cap, not a tuning knob: it sits well above the broker's RemoteLogManager concurrency
+    // (Kafka 4.x defaults: copier pool 10, reader threads 10, manager pool 2) and matches the HTTP
+    // connection pool, since each bounded call uses at most one connection. With the apache transport
+    // a timed-out call is aborted and its thread freed, so the cap is effectively unreachable; it
+    // exists to fail fast (rather than spawn threads unbounded) if the non-abortable urlconnection
+    // transport is paired with gcs.operation.timeout and calls pile up during a sustained stall.
+    private static final int MAX_CONCURRENT_OPERATIONS = MAX_HTTP_CONNECTIONS;
+
     private volatile Storage storage;
     private String bucketName;
     private MetricCollector metricCollector;
@@ -64,7 +76,8 @@ public class GcsStorage implements StorageBackend {
     private ReloadableCredentialsProvider credentialsProvider;
     private StorageOptions.Builder storageOptionsBuilder;
     private Duration operationTimeout;
-    private ExecutorService operationExecutor;
+    // Package-private so lifecycle tests can observe shutdown and inject a saturated executor.
+    ExecutorService operationExecutor;
 
     // The Apache HttpClient transport, when gcs.http.transport=apache. Built once in configure()
     // and reused across every Storage client rebuild (the transport is credential-independent, so
@@ -81,6 +94,11 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public void configure(final Map<String, ?> configs) {
+        // configure() is normally called once, but be idempotent: release anything a prior call
+        // created so a re-configure doesn't leak the executor/credentials watcher or orphan a
+        // Metrics instance whose JmxReporter still owns the (JVM-global, untagged) GCS MBeans.
+        releaseResourcesQuietly();
+
         final GcsStorageConfig config = new GcsStorageConfig(configs);
         this.bucketName = config.bucketName();
 
@@ -158,11 +176,7 @@ public class GcsStorage implements StorageBackend {
         // honor RetrySettings.totalTimeout for resumable uploads.
         operationTimeout = config.operationTimeout();
         if (operationTimeout != null) {
-            operationExecutor = Executors.newCachedThreadPool(r -> {
-                final Thread t = new Thread(r, "gcs-operation");
-                t.setDaemon(true);
-                return t;
-            });
+            operationExecutor = newOperationExecutor(MAX_CONCURRENT_OPERATIONS);
         }
     }
 
@@ -189,12 +203,79 @@ public class GcsStorage implements StorageBackend {
         return retryBuilder.build();
     }
 
+    /**
+     * A bounded daemon thread pool for {@link #runBounded} tasks. Unlike
+     * {@link java.util.concurrent.Executors#newCachedThreadPool}, the thread count is capped at
+     * {@code maxThreads}: with a {@link SynchronousQueue} (no work queue) and an
+     * {@link ThreadPoolExecutor.AbortPolicy abort} rejection policy, a submission beyond the cap is
+     * rejected with {@link RejectedExecutionException} rather than spawning an unbounded number of
+     * threads (and sockets) when calls stall and pile up.
+     *
+     * <p>Package-private so {@code GcsStorageOperationExecutorTest} can assert the bound and the
+     * rejection behaviour directly.
+     */
+    static ThreadPoolExecutor newOperationExecutor(final int maxThreads) {
+        final ThreadFactory threadFactory = r -> {
+            final Thread t = new Thread(r, "gcs-operation");
+            t.setDaemon(true);
+            return t;
+        };
+        return new ThreadPoolExecutor(
+            0, maxThreads,
+            60L, TimeUnit.SECONDS,
+            new SynchronousQueue<>(),
+            threadFactory,
+            new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    /**
+     * Best-effort release of everything {@link #configure} allocates, swallowing errors. Called at
+     * the top of {@code configure()} to make re-configuration idempotent; {@link #close()} performs
+     * the same teardown but surfaces failures to the caller. Fields are nulled so a subsequent
+     * {@code configure()} starts clean (e.g. switching apache -> urlconnection drops the transport).
+     */
+    private void releaseResourcesQuietly() {
+        if (operationExecutor != null) {
+            operationExecutor.shutdownNow();
+            operationExecutor = null;
+        }
+        if (apacheTransport != null) {
+            try {
+                apacheTransport.shutdown();
+            } catch (final IOException ignored) {
+                // best effort
+            }
+            apacheTransport = null;
+        }
+        if (credentialsProvider != null) {
+            try {
+                credentialsProvider.close();
+            } catch (final Exception ignored) {
+                // best effort
+            }
+            credentialsProvider = null;
+        }
+        if (metricCollector != null) {
+            try {
+                metricCollector.close();
+            } catch (final IOException ignored) {
+                // best effort
+            }
+            metricCollector = null;
+        }
+    }
+
     @Override
     public long upload(final InputStream inputStream, final ObjectKey key) throws StorageBackendException {
         return runBounded(() -> doUpload(inputStream, key), "upload " + key);
     }
 
     private long doUpload(final InputStream inputStream, final ObjectKey key) throws StorageBackendException {
+        // Note: when this runs on the operation executor and gcs.operation.timeout fires on the
+        // non-abortable urlconnection transport, the caller (runBounded) returns while this worker
+        // may still be reading inputStream. That is benign here — the worker's result is discarded
+        // and the SDK closes the stream when its createFrom unwinds — but it is why the apache
+        // transport (which aborts the request) is preferred when a timeout is configured.
         try {
             final BlobInfo blobInfo = BlobInfo.newBuilder(this.bucketName, key.value()).build();
             final Blob blob;
@@ -308,14 +389,22 @@ public class GcsStorage implements StorageBackend {
         // timeout. Set inside the lambda (so it's the actual worker, not the submitter), cleared
         // in finally so activeApacheRequests/cancelledWorkers don't grow.
         final AtomicReference<Thread> workerRef = new AtomicReference<>();
-        final Future<T> future = operationExecutor.submit(() -> {
-            workerRef.set(Thread.currentThread());
-            try {
-                return action.call();
-            } finally {
-                requestTracker.clear(Thread.currentThread());
-            }
-        });
+        final Future<T> future;
+        try {
+            future = operationExecutor.submit(() -> {
+                workerRef.set(Thread.currentThread());
+                try {
+                    return action.call();
+                } finally {
+                    requestTracker.clear(Thread.currentThread());
+                }
+            });
+        } catch (final RejectedExecutionException e) {
+            // The bounded pool is saturated (MAX_CONCURRENT_OPERATIONS in flight). Fail fast rather
+            // than block or spawn unbounded threads; the caller (RLM) treats this as a retryable
+            // failure of this segment's copy/fetch/delete.
+            throw new StorageBackendException("Too many concurrent GCS operations to " + description, e);
+        }
         try {
             return future.get(operationTimeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (final TimeoutException e) {
