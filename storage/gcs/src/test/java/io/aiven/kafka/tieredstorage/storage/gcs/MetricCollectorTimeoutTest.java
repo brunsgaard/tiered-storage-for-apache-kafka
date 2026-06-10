@@ -33,30 +33,69 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Verify that {@link MetricCollector#httpTransportOptions} plumbs the writeTimeout
- * through to the per-request {@link HttpRequest#setWriteTimeout(int)} call.
+ * Verify that {@link MetricCollector#httpTransportOptions} plumbs the write, read, and connect
+ * timeouts through to the per-request {@link HttpRequest} setters.
  *
- * <p>This is the load-bearing assertion behind the {@code gcs.http.write.timeout} setting:
- * without it, {@code NetHttpRequest.writeContentToOutputStream} takes the unbounded write
- * path, and a half-open TCP connection blocks the upload thread until the kernel TCP
- * retransmit window expires.
+ * <p>These are the load-bearing assertions behind {@code gcs.http.write.timeout},
+ * {@code gcs.http.read.timeout}, and {@code gcs.http.connect.timeout}: the values are applied to
+ * every request the SDK issues — including the media-download GETs backing {@code fetch()}'s
+ * lazily-read stream — which is what bounds the read path that {@code gcs.operation.timeout} does
+ * not reach (its bound returns before the stream's bytes are pulled).
  */
-class MetricCollectorWriteTimeoutTest {
+class MetricCollectorTimeoutTest {
+
+    // HttpTransportOptions defaults both connect and read timeouts to 20s. It does not set a write
+    // timeout, so HttpRequest's own default (0 = unbounded) is left in place when writeTimeout is null.
+    private static final int TRANSPORT_DEFAULT_TIMEOUT_MS = 20_000;
 
     @Test
     void writeTimeoutIsAppliedToHttpRequest() throws Exception {
-        final HttpRequest request = buildInitializedRequest(Duration.ofSeconds(45));
+        final HttpRequest request = buildInitializedRequest(Duration.ofSeconds(45), null, null);
         assertThat(request.getWriteTimeout()).isEqualTo(45_000);
     }
 
     @Test
     void writeTimeoutNullLeavesDefault() throws Exception {
-        // HttpRequest's default writeTimeout is 0 (unbounded for NetHttpTransport).
-        final HttpRequest request = buildInitializedRequest(null);
+        final HttpRequest request = buildInitializedRequest(null, null, null);
         assertThat(request.getWriteTimeout()).isEqualTo(0);
     }
 
-    private static HttpRequest buildInitializedRequest(final Duration writeTimeout) throws Exception {
+    @Test
+    void readTimeoutIsAppliedToHttpRequest() throws Exception {
+        final HttpRequest request = buildInitializedRequest(null, Duration.ofSeconds(30), null);
+        assertThat(request.getReadTimeout()).isEqualTo(30_000);
+    }
+
+    @Test
+    void readTimeoutNullLeavesTransportDefault() throws Exception {
+        final HttpRequest request = buildInitializedRequest(null, null, null);
+        assertThat(request.getReadTimeout()).isEqualTo(TRANSPORT_DEFAULT_TIMEOUT_MS);
+    }
+
+    @Test
+    void connectTimeoutIsAppliedToHttpRequest() throws Exception {
+        final HttpRequest request = buildInitializedRequest(null, null, Duration.ofSeconds(10));
+        assertThat(request.getConnectTimeout()).isEqualTo(10_000);
+    }
+
+    @Test
+    void connectTimeoutNullLeavesTransportDefault() throws Exception {
+        final HttpRequest request = buildInitializedRequest(null, null, null);
+        assertThat(request.getConnectTimeout()).isEqualTo(TRANSPORT_DEFAULT_TIMEOUT_MS);
+    }
+
+    @Test
+    void allTimeoutsAreAppliedIndependently() throws Exception {
+        final HttpRequest request = buildInitializedRequest(
+            Duration.ofSeconds(45), Duration.ofSeconds(30), Duration.ofSeconds(10));
+        assertThat(request.getWriteTimeout()).isEqualTo(45_000);
+        assertThat(request.getReadTimeout()).isEqualTo(30_000);
+        assertThat(request.getConnectTimeout()).isEqualTo(10_000);
+    }
+
+    private static HttpRequest buildInitializedRequest(final Duration writeTimeout,
+                                                       final Duration readTimeout,
+                                                       final Duration connectTimeout) throws Exception {
         final HttpTransport transport = new MockHttpTransport() {
             @Override
             public LowLevelHttpRequest buildRequest(final String method, final String url) {
@@ -72,7 +111,7 @@ class MetricCollectorWriteTimeoutTest {
         final var transportOptions = new MetricCollector().httpTransportOptions(
             com.google.cloud.http.HttpTransportOptions.newBuilder()
                 .setHttpTransportFactory(() -> transport),
-            writeTimeout, null, null);
+            writeTimeout, readTimeout, connectTimeout);
 
         // Build a Storage so we can borrow its ServiceOptions to feed the initializer.
         final var storageOptions = StorageOptions.newBuilder()

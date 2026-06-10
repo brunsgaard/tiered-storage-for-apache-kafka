@@ -49,6 +49,8 @@ class GcsStorageConfigTest {
         assertThat(config.endpointUrl()).isNull();
         assertThat(config.resumableUploadChunkSize()).isEqualTo(25 * 1024 * 1024);
         assertThat(config.httpWriteTimeout()).isNull();
+        assertThat(config.httpReadTimeout()).isNull();
+        assertThat(config.httpConnectTimeout()).isNull();
         assertThat(config.apiRetryTotalTimeout()).isNull();
         assertThat(config.apiRetryMaxAttempts()).isNull();
         assertThat(config.operationTimeout()).isNull();
@@ -86,6 +88,37 @@ class GcsStorageConfigTest {
         assertThatThrownBy(() -> new GcsStorageConfig(Map.of("gcs.bucket.name", "")))
             .isInstanceOf(ConfigException.class)
             .hasMessage("Invalid value  for configuration gcs.bucket.name: String must be non-empty");
+    }
+
+    @Test
+    void httpReadAndConnectTimeoutAreParsed() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true",
+            "gcs.http.read.timeout", "30000",
+            "gcs.http.connect.timeout", "10000"));
+        assertThat(config.httpReadTimeout()).isEqualTo(Duration.ofMillis(30000));
+        assertThat(config.httpConnectTimeout()).isEqualTo(Duration.ofMillis(10000));
+    }
+
+    @Test
+    void httpReadTimeoutBelowRangeRejected() {
+        final var props = Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.http.read.timeout", "0");
+        assertThatThrownBy(() -> new GcsStorageConfig(props))
+            .isInstanceOf(ConfigException.class)
+            .hasMessageContaining("gcs.http.read.timeout");
+    }
+
+    @Test
+    void httpConnectTimeoutAboveRangeRejected() {
+        final var props = Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.http.connect.timeout", Long.toString((long) Integer.MAX_VALUE + 1L));
+        assertThatThrownBy(() -> new GcsStorageConfig(props))
+            .isInstanceOf(ConfigException.class)
+            .hasMessageContaining("gcs.http.connect.timeout");
     }
 
     @Test
