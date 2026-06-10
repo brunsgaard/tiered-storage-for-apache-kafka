@@ -30,7 +30,12 @@ import io.aiven.kafka.tieredstorage.config.validators.Null;
 import io.aiven.kafka.tieredstorage.config.validators.ValidUrl;
 import io.aiven.kafka.tieredstorage.storage.proxy.ProxyConfig;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public class GcsStorageConfig extends AbstractConfig {
+    private static final Logger LOGGER = LoggerFactory.getLogger(GcsStorageConfig.class);
+
     static final String GCS_BUCKET_NAME_CONFIG = "gcs.bucket.name";
     private static final String GCS_BUCKET_NAME_DOC = "GCS bucket to store log segments";
 
@@ -65,7 +70,9 @@ public class GcsStorageConfig extends AbstractConfig {
             + "the SDK default. Bounds the cumulative time spent inside StorageOptions retry "
             + "loops (e.g. resumable upload chunk PUT retries). Combine with "
             + GCS_HTTP_WRITE_TIMEOUT_CONFIG + " to prevent indefinite retry-then-block cycles "
-            + "during sustained network breakage. When unset, the SDK default applies.";
+            + "during sustained network breakage. Note this is best-effort: the SDK's "
+            + "resumable-upload path does not reliably honor it, so gcs.operation.timeout "
+            + "is the authoritative backstop. When unset, the SDK default applies.";
 
     static final String GCS_API_RETRY_MAX_ATTEMPTS_CONFIG = "gcs.api.retry.max.attempts";
     private static final String GCS_API_RETRY_MAX_ATTEMPTS_DOC =
@@ -115,12 +122,10 @@ public class GcsStorageConfig extends AbstractConfig {
 
     static final String GCS_HTTP_CONNECT_TIMEOUT_CONFIG = "gcs.http.connect.timeout";
     private static final String GCS_HTTP_CONNECT_TIMEOUT_DOC =
-        "Timeout in milliseconds for establishing a connection to GCS, applied to every HTTP "
-            + "request issued by the underlying transport. With " + GCS_HTTP_TRANSPORT_APACHE + " "
-            + "this value also bounds the wait to lease a connection from the bounded HTTP "
-            + "connection pool (connectionRequestTimeout): without it, once the pool is exhausted by "
-            + "stalled requests a new request blocks indefinitely waiting for a free connection. "
-            + "Applies to both transports. When unset, the SDK default applies.";
+        "Timeout in milliseconds for establishing the TCP connection to GCS, applied to every HTTP "
+            + "request issued by the underlying transport. Bounds the time spent in connect() against "
+            + "an unreachable or black-holed endpoint. Applies to both transports. When unset, the "
+            + "SDK default applies.";
 
     static final String GCP_CREDENTIALS_JSON_CONFIG = "gcs.credentials.json";
     static final String GCP_CREDENTIALS_PATH_CONFIG = "gcs.credentials.path";
@@ -278,6 +283,31 @@ public class GcsStorageConfig extends AbstractConfig {
                 + "only useful as the lever that makes a " + GCS_OPERATION_TIMEOUT_CONFIG + "-bounded call "
                 + "abortable.");
         }
+
+        // The inverse is allowed but only partially effective, so warn rather than reject (rejecting
+        // would break existing urlconnection deployments that rely on operation.timeout to bound the
+        // caller's wait). On the default urlconnection transport an expired operation.timeout cannot
+        // abort the in-flight request, so the worker thread leaks until the kernel TCP retransmit
+        // window expires (15+ min on default Linux). The apache transport makes the timeout actually
+        // cancel the work.
+        if (operationTimeoutWithoutAbortableTransport()) {
+            LOGGER.warn("{} is set but {}={}: on a stall the timeout will fail the call yet leave its "
+                    + "worker thread blocked until the OS tears the TCP connection down. Set {}={} so "
+                    + "the timeout can abort the in-flight request and free the thread promptly.",
+                GCS_OPERATION_TIMEOUT_CONFIG, GCS_HTTP_TRANSPORT_CONFIG,
+                getString(GCS_HTTP_TRANSPORT_CONFIG), GCS_HTTP_TRANSPORT_CONFIG, GCS_HTTP_TRANSPORT_APACHE);
+        }
+    }
+
+    /**
+     * True when {@code gcs.operation.timeout} is set on a transport that cannot abort an in-flight
+     * request (i.e. anything other than {@code apache}). Such a timeout still fails the call on
+     * expiry but leaves the worker thread blocked until the OS closes the socket. Package-private so
+     * {@code GcsStorageConfigTest} can assert the condition across transport/timeout combinations.
+     */
+    boolean operationTimeoutWithoutAbortableTransport() {
+        return getLong(GCS_OPERATION_TIMEOUT_CONFIG) != null
+            && !GCS_HTTP_TRANSPORT_APACHE.equals(getString(GCS_HTTP_TRANSPORT_CONFIG));
     }
 
     String bucketName() {

@@ -436,12 +436,68 @@ GcsStorageConfig
   * Valid Values: [256 KiB...] values multiple of 262144 bytes
   * Importance: medium
 
+``gcs.api.retry.max.attempts``
+  Maximum number of attempts for a single GCS API call, overriding the SDK default. 0 means unlimited (subject to gcs.api.retry.total.timeout). When unset, the SDK default applies.
+
+  * Type: int
+  * Default: null
+  * Valid Values: null or [0,...,2147483647]
+  * Importance: low
+
+``gcs.api.retry.total.timeout``
+  Total timeout in milliseconds for a single GCS API call across retries, overriding the SDK default. Bounds the cumulative time spent inside StorageOptions retry loops (e.g. resumable upload chunk PUT retries). Combine with gcs.http.write.timeout to prevent indefinite retry-then-block cycles during sustained network breakage. Note this is best-effort: the SDK's resumable-upload path does not reliably honor it, so gcs.operation.timeout is the authoritative backstop. When unset, the SDK default applies.
+
+  * Type: long
+  * Default: null
+  * Valid Values: null or [1,...,9223372036854775807]
+  * Importance: low
+
 ``gcs.endpoint.url``
   Custom GCS endpoint URL. To be used with custom GCS-compatible backends.
 
   * Type: string
   * Default: null
   * Valid Values: Valid URL as defined in rfc2396
+  * Importance: low
+
+``gcs.http.connect.timeout``
+  Timeout in milliseconds for establishing the TCP connection to GCS, applied to every HTTP request issued by the underlying transport. Bounds the time spent in connect() against an unreachable or black-holed endpoint. Applies to both transports. When unset, the SDK default applies.
+
+  * Type: long
+  * Default: null
+  * Valid Values: null or [1,...,2147483647]
+  * Importance: low
+
+``gcs.http.read.timeout``
+  Timeout in milliseconds for reading data from GCS, applied as the socket read (SO_TIMEOUT) on every HTTP request issued by the underlying transport. This is the read-path counterpart to gcs.http.write.timeout. It bounds per-read inactivity, including the streaming segment download backing fetch() (whose bytes are pulled lazily, after gcs.operation.timeout's bound has already returned, so the operation timeout does not cover them). It is an inactivity bound, not a total-transfer bound: a healthy large download is not interrupted; only a stall (e.g. a half-open TCP connection where no bytes arrive) throws SocketTimeoutException after the timeout. Applies to both transports. When unset, the SDK default applies.
+
+  * Type: long
+  * Default: null
+  * Valid Values: null or [1,...,2147483647]
+  * Importance: low
+
+``gcs.http.transport``
+  HTTP transport implementation for the GCS client. 'urlconnection' (default) uses java.net.HttpURLConnection via google-http-client's NetHttpTransport. 'apache' uses Apache HttpClient via ApacheHttpTransport, which exposes a per-request abort() that the plugin uses on the gcs.operation.timeout to force-close the underlying socket. With urlconnection, an in-flight write that has filled the kernel send buffer cannot be cancelled mid-flight (the worker thread leaks until the kernel TCP retransmit window expires). With apache, the worker thread is unblocked promptly when the call timeout fires.
+
+  * Type: string
+  * Default: urlconnection
+  * Valid Values: [urlconnection, apache]
+  * Importance: low
+
+``gcs.http.write.timeout``
+  Timeout in milliseconds for writing the request body to GCS, applied to every HTTP request issued by the underlying transport. Bounds chunk PUT writes during resumable upload. Without this setting, a half-open TCP connection can block the upload thread until the kernel TCP retransmit window expires (15+ minutes on default Linux), because java.net.HttpURLConnection has no socket-level write timeout. When set, google-http-client bounds each write and throws IOException on expiry, allowing the SDK to retry or surface the error. When unset, no write timeout is applied.
+
+  * Type: long
+  * Default: null
+  * Valid Values: null or [1,...,2147483647]
+  * Importance: low
+
+``gcs.operation.timeout``
+  Hard upper bound in milliseconds on a single plugin-level call to GCS (upload, fetch, delete). When set, the call runs on a separate executor and is bounded with Future.get(timeout); on expiry the plugin throws StorageBackendException regardless of what the SDK is doing internally. This is the outermost wall around the SDK's retry layers, which empirically do not always honor gcs.api.retry.total.timeout for resumable uploads, giving callers a deterministic time-to-failure when GCS or the network path is misbehaving. The cancelled task continues running on a daemon thread until the kernel TCP retransmit window expires (15+ min on default Linux), so leaked work is bounded but non-zero. When unset, calls run synchronously with no plugin-level bound.
+
+  * Type: long
+  * Default: null
+  * Valid Values: null or [1,...,9223372036854775807]
   * Importance: low
 
 

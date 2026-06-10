@@ -181,8 +181,7 @@ public class MetricCollector implements Closeable {
         // fetch()'s lazily-read stream — which gcs.operation.timeout does not reach.
         //   - writeTimeout  -> bounds the request body write (HttpRequest default 0 = unbounded).
         //   - readTimeout   -> socket SO_TIMEOUT: per-read inactivity bound on the response body.
-        //   - connectTimeout-> TCP connect; with apache.v2 this also maps to connectionRequestTimeout
-        //     (the bounded connection pool's lease wait).
+        //   - connectTimeout-> bounds establishing the TCP connection.
         final int writeTimeoutMs = toMillisOrUnset(writeTimeout);
         final int readTimeoutMs = toMillisOrUnset(readTimeout);
         final int connectTimeoutMs = toMillisOrUnset(connectTimeout);

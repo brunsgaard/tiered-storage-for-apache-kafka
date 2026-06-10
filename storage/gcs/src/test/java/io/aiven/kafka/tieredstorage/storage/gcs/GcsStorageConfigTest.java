@@ -122,6 +122,34 @@ class GcsStorageConfigTest {
     }
 
     @Test
+    void operationTimeoutWithUrlconnectionIsFlaggedButAllowed() {
+        // Default transport is urlconnection; operation.timeout there can't abort -> warned, not rejected.
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true",
+            "gcs.operation.timeout", "3000"));
+        assertThat(config.operationTimeoutWithoutAbortableTransport()).isTrue();
+    }
+
+    @Test
+    void operationTimeoutWithApacheIsNotFlagged() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true",
+            "gcs.http.transport", "apache",
+            "gcs.operation.timeout", "3000"));
+        assertThat(config.operationTimeoutWithoutAbortableTransport()).isFalse();
+    }
+
+    @Test
+    void noOperationTimeoutIsNotFlagged() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true"));
+        assertThat(config.operationTimeoutWithoutAbortableTransport()).isFalse();
+    }
+
+    @Test
     void emptyJsonCredentials() {
         final var props = Map.of(
             "gcs.bucket.name", "bucket",
