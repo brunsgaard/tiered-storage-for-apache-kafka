@@ -72,7 +72,7 @@ class MetricCollectorWriteTimeoutTest {
         final var transportOptions = new MetricCollector().httpTransportOptions(
             com.google.cloud.http.HttpTransportOptions.newBuilder()
                 .setHttpTransportFactory(() -> transport),
-            writeTimeout);
+            writeTimeout, null, null);
 
         // Build a Storage so we can borrow its ServiceOptions to feed the initializer.
         final var storageOptions = StorageOptions.newBuilder()

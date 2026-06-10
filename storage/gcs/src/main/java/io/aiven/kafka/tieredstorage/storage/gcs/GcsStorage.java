@@ -124,12 +124,15 @@ public class GcsStorage implements StorageBackend {
         // Create reloadable credentials provider
         this.credentialsProvider = config.reloadableCredentials();
 
-        // Store the builder template for recreating storage clients. The write timeout and
+        // Store the builder template for recreating storage clients. The HTTP timeouts and
         // retry settings are set on the template (not on the per-call client) so they are
         // preserved when the client is rebuilt on a credentials reload.
         this.storageOptionsBuilder = StorageOptions.newBuilder()
             .setTransportOptions(metricCollector.httpTransportOptions(
-                httpTransportOptionsBuilder, config.httpWriteTimeout()));
+                httpTransportOptionsBuilder,
+                config.httpWriteTimeout(),
+                config.httpReadTimeout(),
+                config.httpConnectTimeout()));
         if (config.endpointUrl() != null) {
             this.storageOptionsBuilder.setHost(config.endpointUrl());
         }

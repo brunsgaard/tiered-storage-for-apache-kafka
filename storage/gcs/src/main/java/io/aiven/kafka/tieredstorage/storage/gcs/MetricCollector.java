@@ -172,13 +172,20 @@ public class MetricCollector implements Closeable {
     }
 
     HttpTransportOptions httpTransportOptions(final HttpTransportOptions.Builder builder,
-                                              final Duration writeTimeout) {
-        // A null writeTimeout means "do not call setWriteTimeout"; the HttpRequest default
-        // (0 = unbounded for NetHttpTransport) is left in place. When writeTimeout is set,
-        // NetHttpRequest bounds the body write and throws IOException on expiry.
-        final int writeTimeoutMs = writeTimeout != null
-            ? Math.toIntExact(writeTimeout.toMillis())
-            : -1;
+                                              final Duration writeTimeout,
+                                              final Duration readTimeout,
+                                              final Duration connectTimeout) {
+        // A null timeout means "do not override"; the value the super initializer already applied
+        // (the SDK/transport default) is left in place. When set, each value is applied per-request
+        // so it covers every request the SDK issues, including the media-download GETs backing
+        // fetch()'s lazily-read stream — which gcs.operation.timeout does not reach.
+        //   - writeTimeout  -> bounds the request body write (HttpRequest default 0 = unbounded).
+        //   - readTimeout   -> socket SO_TIMEOUT: per-read inactivity bound on the response body.
+        //   - connectTimeout-> TCP connect; with apache.v2 this also maps to connectionRequestTimeout
+        //     (the bounded connection pool's lease wait).
+        final int writeTimeoutMs = toMillisOrUnset(writeTimeout);
+        final int readTimeoutMs = toMillisOrUnset(readTimeout);
+        final int connectTimeoutMs = toMillisOrUnset(connectTimeout);
         return new HttpTransportOptions(builder) {
             @Override
             public HttpRequestInitializer getHttpRequestInitializer(final ServiceOptions<?, ?> serviceOptions) {
@@ -189,9 +196,19 @@ public class MetricCollector implements Closeable {
                     if (writeTimeoutMs >= 0) {
                         request.setWriteTimeout(writeTimeoutMs);
                     }
+                    if (readTimeoutMs >= 0) {
+                        request.setReadTimeout(readTimeoutMs);
+                    }
+                    if (connectTimeoutMs >= 0) {
+                        request.setConnectTimeout(connectTimeoutMs);
+                    }
                 };
             }
         };
+    }
+
+    private static int toMillisOrUnset(final Duration timeout) {
+        return timeout != null ? Math.toIntExact(timeout.toMillis()) : -1;
     }
 
     @Override

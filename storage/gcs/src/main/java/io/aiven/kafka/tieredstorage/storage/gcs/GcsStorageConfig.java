@@ -101,6 +101,27 @@ public class GcsStorageConfig extends AbstractConfig {
             + "leaked work is bounded but non-zero. When unset, calls run synchronously with no "
             + "plugin-level bound.";
 
+    static final String GCS_HTTP_READ_TIMEOUT_CONFIG = "gcs.http.read.timeout";
+    private static final String GCS_HTTP_READ_TIMEOUT_DOC =
+        "Timeout in milliseconds for reading data from GCS, applied as the socket read "
+            + "(SO_TIMEOUT) on every HTTP request issued by the underlying transport. This is the "
+            + "read-path counterpart to " + GCS_HTTP_WRITE_TIMEOUT_CONFIG + ". It bounds per-read "
+            + "inactivity, including the streaming segment download backing fetch() (whose bytes are "
+            + "pulled lazily, after " + GCS_OPERATION_TIMEOUT_CONFIG + "'s bound has already returned, "
+            + "so the operation timeout does not cover them). It is an inactivity bound, not a "
+            + "total-transfer bound: a healthy large download is not interrupted; only a stall "
+            + "(e.g. a half-open TCP connection where no bytes arrive) throws SocketTimeoutException "
+            + "after the timeout. Applies to both transports. When unset, the SDK default applies.";
+
+    static final String GCS_HTTP_CONNECT_TIMEOUT_CONFIG = "gcs.http.connect.timeout";
+    private static final String GCS_HTTP_CONNECT_TIMEOUT_DOC =
+        "Timeout in milliseconds for establishing a connection to GCS, applied to every HTTP "
+            + "request issued by the underlying transport. With " + GCS_HTTP_TRANSPORT_APACHE + " "
+            + "this value also bounds the wait to lease a connection from the bounded HTTP "
+            + "connection pool (connectionRequestTimeout): without it, once the pool is exhausted by "
+            + "stalled requests a new request blocks indefinitely waiting for a free connection. "
+            + "Applies to both transports. When unset, the SDK default applies.";
+
     static final String GCP_CREDENTIALS_JSON_CONFIG = "gcs.credentials.json";
     static final String GCP_CREDENTIALS_PATH_CONFIG = "gcs.credentials.path";
     static final String GCP_CREDENTIALS_DEFAULT_CONFIG = "gcs.credentials.default";
@@ -146,6 +167,20 @@ public class GcsStorageConfig extends AbstractConfig {
                 Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
                 ConfigDef.Importance.LOW,
                 GCS_HTTP_WRITE_TIMEOUT_DOC)
+            .define(
+                GCS_HTTP_READ_TIMEOUT_CONFIG,
+                ConfigDef.Type.LONG,
+                null,
+                Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_HTTP_READ_TIMEOUT_DOC)
+            .define(
+                GCS_HTTP_CONNECT_TIMEOUT_CONFIG,
+                ConfigDef.Type.LONG,
+                null,
+                Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_HTTP_CONNECT_TIMEOUT_DOC)
             .define(
                 GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG,
                 ConfigDef.Type.LONG,
@@ -259,6 +294,14 @@ public class GcsStorageConfig extends AbstractConfig {
 
     Duration httpWriteTimeout() {
         return getDurationMillis(GCS_HTTP_WRITE_TIMEOUT_CONFIG);
+    }
+
+    Duration httpReadTimeout() {
+        return getDurationMillis(GCS_HTTP_READ_TIMEOUT_CONFIG);
+    }
+
+    Duration httpConnectTimeout() {
+        return getDurationMillis(GCS_HTTP_CONNECT_TIMEOUT_CONFIG);
     }
 
     Duration apiRetryTotalTimeout() {
