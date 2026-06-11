@@ -126,6 +126,20 @@ public class GcsStorageConfig extends AbstractConfig {
             + "an unreachable or black-holed endpoint. Applies to both transports. When unset, the "
             + "SDK default applies.";
 
+    static final String GCS_HTTP_MAX_CONNECTIONS_CONFIG = "gcs.http.max.connections";
+    static final int GCS_HTTP_MAX_CONNECTIONS_DEFAULT = 50;
+    private static final String GCS_HTTP_MAX_CONNECTIONS_DOC =
+        "Size of the Apache HTTP connection pool (both total and per-route), used only when "
+            + GCS_HTTP_TRANSPORT_CONFIG + "=" + GCS_HTTP_TRANSPORT_APACHE + ". Apache HttpClient "
+            + "defaults to 2 connections per route, which would serialize concurrent "
+            + "upload/fetch/delete operations; this raises it. Size it to your concurrency: it "
+            + "should be at least the broker's RemoteLogManager copier + reader thread-pool sizes "
+            + "(each in-flight operation uses one connection), so raise it alongside "
+            + "remote.log.manager.copier.thread.pool.size and remote.log.reader.threads if you tune "
+            + "those above the default. The default (" + GCS_HTTP_MAX_CONNECTIONS_DEFAULT + ") sits "
+            + "well above the broker defaults (copier 10, readers 10). Ignored on the "
+            + GCS_HTTP_TRANSPORT_URLCONNECTION + " transport.";
+
     static final String GCP_CREDENTIALS_JSON_CONFIG = "gcs.credentials.json";
     static final String GCP_CREDENTIALS_PATH_CONFIG = "gcs.credentials.path";
     static final String GCP_CREDENTIALS_DEFAULT_CONFIG = "gcs.credentials.default";
@@ -185,6 +199,13 @@ public class GcsStorageConfig extends AbstractConfig {
                 Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
                 ConfigDef.Importance.LOW,
                 GCS_HTTP_CONNECT_TIMEOUT_DOC)
+            .define(
+                GCS_HTTP_MAX_CONNECTIONS_CONFIG,
+                ConfigDef.Type.INT,
+                GCS_HTTP_MAX_CONNECTIONS_DEFAULT,
+                ConfigDef.Range.atLeast(1),
+                ConfigDef.Importance.LOW,
+                GCS_HTTP_MAX_CONNECTIONS_DOC)
             .define(
                 GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG,
                 ConfigDef.Type.LONG,
@@ -319,6 +340,10 @@ public class GcsStorageConfig extends AbstractConfig {
 
     Duration httpConnectTimeout() {
         return getDurationMillis(GCS_HTTP_CONNECT_TIMEOUT_CONFIG);
+    }
+
+    int httpMaxConnections() {
+        return getInt(GCS_HTTP_MAX_CONNECTIONS_CONFIG);
     }
 
     Duration apiRetryTotalTimeout() {

@@ -54,12 +54,6 @@ import com.google.cloud.storage.StorageOptions;
 import org.apache.http.impl.client.HttpClientBuilder;
 
 public class GcsStorage implements StorageBackend {
-    // Apache HttpClient connection-pool sizing (total and per-route). PoolingHttpClientConnectionManager
-    // defaults to 20 total / 2 per route, which would serialize concurrent upload/fetch/delete behind
-    // 2 connections to storage.googleapis.com; we bump both well above peak GCS concurrency and leave
-    // slack for in-flight aborts (a connection mid-shutdown doesn't free its slot until close completes).
-    private static final int MAX_HTTP_CONNECTIONS = 50;
-
     private volatile Storage storage;
     private String bucketName;
     private MetricCollector metricCollector;
@@ -122,8 +116,8 @@ public class GcsStorage implements StorageBackend {
                 // fresh connection, defeating the abort. The GCS SDK has its own retry layer
                 // (controlled via gcs.api.retry.*), so Apache's is redundant and harmful here.
                 .disableAutomaticRetries()
-                .setMaxConnTotal(MAX_HTTP_CONNECTIONS)
-                .setMaxConnPerRoute(MAX_HTTP_CONNECTIONS)
+                .setMaxConnTotal(config.httpMaxConnections())
+                .setMaxConnPerRoute(config.httpMaxConnections())
                 .build();
             // Build the transport once and reuse it for every client rebuild (see field comment).
             this.apacheTransport = new ApacheHttpTransport(httpClient);
