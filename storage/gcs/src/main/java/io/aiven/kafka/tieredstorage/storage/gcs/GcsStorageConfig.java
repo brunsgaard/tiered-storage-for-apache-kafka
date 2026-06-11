@@ -282,6 +282,19 @@ public class GcsStorageConfig extends AbstractConfig {
                 + "only useful as the lever that makes a " + GCS_OPERATION_TIMEOUT_CONFIG + "-bounded call "
                 + "abortable.");
         }
+
+        // ...and the inverse: operation.timeout is only meaningful on a transport whose in-flight
+        // request can be aborted. On any other transport an expired timeout fails the call but leaves
+        // the worker blocked until the OS tears the socket down — i.e. it leaks a thread and the
+        // bound is only half-real. Require apache rather than silently under-deliver. (The two are
+        // thus mutually required: set both, or neither.)
+        if (getLong(GCS_OPERATION_TIMEOUT_CONFIG) != null
+            && !GCS_HTTP_TRANSPORT_APACHE.equals(getString(GCS_HTTP_TRANSPORT_CONFIG))) {
+            throw new ConfigException(GCS_OPERATION_TIMEOUT_CONFIG + " requires "
+                + GCS_HTTP_TRANSPORT_CONFIG + "=" + GCS_HTTP_TRANSPORT_APACHE
+                + "; only the Apache transport can abort an in-flight request on timeout, so on any "
+                + "other transport the timeout would fail the call but leak its worker thread.");
+        }
     }
 
     String bucketName() {

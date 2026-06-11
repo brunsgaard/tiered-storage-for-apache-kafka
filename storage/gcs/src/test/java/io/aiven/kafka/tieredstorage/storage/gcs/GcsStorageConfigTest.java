@@ -122,6 +122,28 @@ class GcsStorageConfigTest {
     }
 
     @Test
+    void operationTimeoutRequiresApacheTransport() {
+        // Default transport is urlconnection, which cannot abort an in-flight request -> rejected.
+        final var props = Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true",
+            "gcs.operation.timeout", "3000");
+        assertThatThrownBy(() -> new GcsStorageConfig(props))
+            .isInstanceOf(ConfigException.class)
+            .hasMessageContaining("gcs.operation.timeout requires gcs.http.transport=apache");
+    }
+
+    @Test
+    void operationTimeoutWithApacheTransportIsValid() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true",
+            "gcs.http.transport", "apache",
+            "gcs.operation.timeout", "3000"));
+        assertThat(config.operationTimeout()).isEqualTo(Duration.ofMillis(3000));
+    }
+
+    @Test
     void emptyJsonCredentials() {
         final var props = Map.of(
             "gcs.bucket.name", "bucket",
@@ -374,6 +396,7 @@ class GcsStorageConfigTest {
         final var config = new GcsStorageConfig(Map.of(
             "gcs.bucket.name", "test-bucket",
             "gcs.credentials.default", "true",
+            "gcs.http.transport", "apache",   // gcs.operation.timeout requires the apache transport
             "gcs.operation.timeout", "120000"
         ));
         assertThat(config.operationTimeout()).isEqualTo(Duration.ofMillis(120_000));
