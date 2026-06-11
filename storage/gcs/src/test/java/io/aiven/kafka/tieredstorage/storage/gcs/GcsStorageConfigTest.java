@@ -54,6 +54,7 @@ class GcsStorageConfigTest {
         assertThat(config.apiRetryTotalTimeout()).isNull();
         assertThat(config.apiRetryMaxAttempts()).isNull();
         assertThat(config.operationTimeout()).isNull();
+        assertThat(config.httpMaxConnections()).isEqualTo(50);
 
         final GoogleCredentials mockCredentials = GoogleCredentials.newBuilder().build();
         try (final MockedStatic<GoogleCredentials> googleCredentialsMockedStatic =
@@ -141,6 +142,25 @@ class GcsStorageConfigTest {
             "gcs.http.transport", "apache",
             "gcs.operation.timeout", "3000"));
         assertThat(config.operationTimeout()).isEqualTo(Duration.ofMillis(3000));
+    }
+
+    @Test
+    void httpMaxConnectionsIsParsed() {
+        final var config = new GcsStorageConfig(Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.credentials.default", "true",
+            "gcs.http.max.connections", "200"));
+        assertThat(config.httpMaxConnections()).isEqualTo(200);
+    }
+
+    @Test
+    void httpMaxConnectionsBelowRangeRejected() {
+        final var props = Map.of(
+            "gcs.bucket.name", "b",
+            "gcs.http.max.connections", "0");
+        assertThatThrownBy(() -> new GcsStorageConfig(props))
+            .isInstanceOf(ConfigException.class)
+            .hasMessageContaining("gcs.http.max.connections");
     }
 
     @Test
