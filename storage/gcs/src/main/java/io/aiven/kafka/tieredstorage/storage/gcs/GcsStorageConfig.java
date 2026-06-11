@@ -112,13 +112,17 @@ public class GcsStorageConfig extends AbstractConfig {
     private static final String GCS_HTTP_READ_TIMEOUT_DOC =
         "Timeout in milliseconds for reading data from GCS, applied as the socket read "
             + "(SO_TIMEOUT) on every HTTP request issued by the underlying transport. This is the "
-            + "read-path counterpart to " + GCS_HTTP_WRITE_TIMEOUT_CONFIG + ". It bounds per-read "
-            + "inactivity, including the streaming segment download backing fetch() (whose bytes are "
-            + "pulled lazily, after " + GCS_OPERATION_TIMEOUT_CONFIG + "'s bound has already returned, "
-            + "so the operation timeout does not cover them). It is an inactivity bound, not a "
-            + "total-transfer bound: a healthy large download is not interrupted; only a stall "
-            + "(e.g. a half-open TCP connection where no bytes arrive) throws SocketTimeoutException "
-            + "after the timeout. Applies to both transports. When unset, the SDK default applies.";
+            + "read-path counterpart to " + GCS_HTTP_WRITE_TIMEOUT_CONFIG + ", and an inactivity "
+            + "bound, not a total-transfer bound: a healthy large download is not interrupted; an "
+            + "individual read attempt that stalls (e.g. a half-open TCP connection where no bytes "
+            + "arrive) throws SocketTimeoutException after the timeout. IMPORTANT: this bounds each "
+            + "read ATTEMPT, not the whole fetch. The google-cloud-storage ReadChannel transparently "
+            + "reopens and retries a failed media download, and that reopen loop is not bounded by "
+            + GCS_OPERATION_TIMEOUT_CONFIG + " (which only covers the metadata get, not the lazily "
+            + "read stream) nor by gcs.api.retry.* (verified against google-cloud-storage 2.61.0). So "
+            + "on a PERSISTENT read stall this caps per-attempt latency and keeps the worker active "
+            + "(not blocked) but does not make fetch() fail fast. Applies to both transports. When "
+            + "unset, the SDK default applies.";
 
     static final String GCS_HTTP_CONNECT_TIMEOUT_CONFIG = "gcs.http.connect.timeout";
     private static final String GCS_HTTP_CONNECT_TIMEOUT_DOC =

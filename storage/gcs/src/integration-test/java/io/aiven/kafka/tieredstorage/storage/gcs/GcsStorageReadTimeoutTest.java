@@ -32,19 +32,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * End-to-end proof that {@code gcs.http.read.timeout} bounds a stalled GCS read. This complements
- * {@code MetricCollectorTimeoutTest} (which verifies the value is plumbed into
- * {@link com.google.api.client.http.HttpRequest}); this test verifies the timeout actually FIRES
- * on a real half-open TCP connection and surfaces as {@link StorageBackendException}.
+ * Proof that {@code gcs.http.read.timeout} fires on a stalled GCS read on the <strong>metadata
+ * GET</strong> path — the request {@code fetch()} issues via {@code Storage.get} before it returns
+ * the stream. Complements {@code MetricCollectorTimeoutTest} (which verifies the value is plumbed
+ * into {@link com.google.api.client.http.HttpRequest}); here the timeout actually FIRES on a real
+ * half-open TCP connection and surfaces as {@link StorageBackendException}.
  *
- * <p>The stall is reproduced by {@link HalfOpenReadGcsServer}: it answers the GCS object-metadata
- * GET (issued by {@code fetch()} via {@code Storage.get}) with response headers promising a body it
- * never sends, so the client blocks reading. With {@code gcs.http.read.timeout} set the socket's
- * SO_TIMEOUT fires; without it, the read would block on the SDK default (~20s) or longer. This is
- * the read-path analogue of {@link GcsStorageWriteTimeoutTest}.
+ * <p>The stall is reproduced by {@link HalfOpenReadGcsServer}: it answers the metadata GET with
+ * response headers promising a body it never sends, so the client blocks reading. The metadata get
+ * respects {@code gcs.api.retry.max.attempts}, so with {@code =1} it fails in one attempt (~the
+ * timeout) rather than the ~20s SDK default.
  *
- * <p>The class-level {@link Timeout} is a hard guard against a regression that re-introduces an
- * unbounded read.
+ * <p><strong>Scope / what this does NOT prove:</strong> this covers the metadata GET, not the
+ * streaming media <em>download</em> body. On the download path the {@code ReadChannel} reopens and
+ * retries unboundedly on each read timeout (not bounded by {@code gcs.api.retry.*} or
+ * {@code gcs.operation.timeout}), so a persistent download stall is NOT fail-fast — see
+ * {@link GcsStorageReadDownloadTimeoutTest}, which characterizes that behavior. Do not read this
+ * test as proof that {@code fetch()} reads are bounded.
+ *
+ * <p>The class-level {@link Timeout} is a hard guard against an unbounded hang.
  */
 @Timeout(value = 90, unit = TimeUnit.SECONDS)
 class GcsStorageReadTimeoutTest {
