@@ -65,7 +65,9 @@ public class GcsStorageConfig extends AbstractConfig {
             + "the SDK default. Bounds the cumulative time spent inside StorageOptions retry "
             + "loops (e.g. resumable upload chunk PUT retries). Combine with "
             + GCS_HTTP_WRITE_TIMEOUT_CONFIG + " to prevent indefinite retry-then-block cycles "
-            + "during sustained network breakage. When unset, the SDK default applies.";
+            + "during sustained network breakage. Note this is best-effort: the SDK's "
+            + "resumable-upload path does not reliably honor it, so gcs.operation.timeout "
+            + "is the authoritative backstop. When unset, the SDK default applies.";
 
     static final String GCS_API_RETRY_MAX_ATTEMPTS_CONFIG = "gcs.api.retry.max.attempts";
     private static final String GCS_API_RETRY_MAX_ATTEMPTS_DOC =
@@ -100,6 +102,29 @@ public class GcsStorageConfig extends AbstractConfig {
             + "until the kernel TCP retransmit window expires (15+ min on default Linux), so "
             + "leaked work is bounded but non-zero. When unset, calls run synchronously with no "
             + "plugin-level bound.";
+
+    static final String GCS_HTTP_READ_TIMEOUT_CONFIG = "gcs.http.read.timeout";
+    private static final String GCS_HTTP_READ_TIMEOUT_DOC =
+        "Timeout in milliseconds for reading data from GCS, applied as the socket read "
+            + "(SO_TIMEOUT) on every HTTP request issued by the underlying transport. This is the "
+            + "read-path counterpart to " + GCS_HTTP_WRITE_TIMEOUT_CONFIG + ", and an inactivity "
+            + "bound, not a total-transfer bound: a healthy large download is not interrupted; an "
+            + "individual read attempt that stalls (e.g. a half-open TCP connection where no bytes "
+            + "arrive) throws SocketTimeoutException after the timeout. IMPORTANT: this bounds each "
+            + "read ATTEMPT, not the whole fetch. The google-cloud-storage ReadChannel transparently "
+            + "reopens and retries a failed media download, and that reopen loop is not bounded by "
+            + GCS_OPERATION_TIMEOUT_CONFIG + " (which only covers the metadata get, not the lazily "
+            + "read stream) nor by gcs.api.retry.* (verified against google-cloud-storage 2.61.0). So "
+            + "on a PERSISTENT read stall this caps per-attempt latency and keeps the worker active "
+            + "(not blocked) but does not make fetch() fail fast. Applies to both transports. When "
+            + "unset, the SDK default applies.";
+
+    static final String GCS_HTTP_CONNECT_TIMEOUT_CONFIG = "gcs.http.connect.timeout";
+    private static final String GCS_HTTP_CONNECT_TIMEOUT_DOC =
+        "Timeout in milliseconds for establishing the TCP connection to GCS, applied to every HTTP "
+            + "request issued by the underlying transport. Bounds the time spent in connect() against "
+            + "an unreachable or black-holed endpoint. Applies to both transports. When unset, the "
+            + "SDK default applies.";
 
     static final String GCP_CREDENTIALS_JSON_CONFIG = "gcs.credentials.json";
     static final String GCP_CREDENTIALS_PATH_CONFIG = "gcs.credentials.path";
@@ -146,6 +171,20 @@ public class GcsStorageConfig extends AbstractConfig {
                 Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
                 ConfigDef.Importance.LOW,
                 GCS_HTTP_WRITE_TIMEOUT_DOC)
+            .define(
+                GCS_HTTP_READ_TIMEOUT_CONFIG,
+                ConfigDef.Type.LONG,
+                null,
+                Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_HTTP_READ_TIMEOUT_DOC)
+            .define(
+                GCS_HTTP_CONNECT_TIMEOUT_CONFIG,
+                ConfigDef.Type.LONG,
+                null,
+                Null.or(ConfigDef.Range.between(1L, (long) Integer.MAX_VALUE)),
+                ConfigDef.Importance.LOW,
+                GCS_HTTP_CONNECT_TIMEOUT_DOC)
             .define(
                 GCS_API_RETRY_TOTAL_TIMEOUT_CONFIG,
                 ConfigDef.Type.LONG,
@@ -259,6 +298,14 @@ public class GcsStorageConfig extends AbstractConfig {
 
     Duration httpWriteTimeout() {
         return getDurationMillis(GCS_HTTP_WRITE_TIMEOUT_CONFIG);
+    }
+
+    Duration httpReadTimeout() {
+        return getDurationMillis(GCS_HTTP_READ_TIMEOUT_CONFIG);
+    }
+
+    Duration httpConnectTimeout() {
+        return getDurationMillis(GCS_HTTP_CONNECT_TIMEOUT_CONFIG);
     }
 
     Duration apiRetryTotalTimeout() {
