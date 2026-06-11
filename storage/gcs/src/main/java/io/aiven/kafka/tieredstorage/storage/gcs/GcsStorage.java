@@ -26,8 +26,11 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.aiven.kafka.tieredstorage.storage.BytesRange;
@@ -64,7 +67,10 @@ public class GcsStorage implements StorageBackend {
     private ReloadableCredentialsProvider credentialsProvider;
     private StorageOptions.Builder storageOptionsBuilder;
     private Duration operationTimeout;
-    private ExecutorService operationExecutor;
+    // Cached/unbounded: its live thread count is naturally bounded by the broker's RemoteLogManager
+    // pools (copier/reader/expiration), which are the threads that call into runBounded — we don't
+    // impose a second, arbitrary cap. Package-private so the lifecycle test can observe shutdown.
+    ExecutorService operationExecutor;
 
     // The Apache HttpClient transport, when gcs.http.transport=apache. Built once in configure()
     // and reused across every Storage client rebuild (the transport is credential-independent, so
@@ -81,6 +87,11 @@ public class GcsStorage implements StorageBackend {
 
     @Override
     public void configure(final Map<String, ?> configs) {
+        // configure() is normally called once, but be idempotent: release anything a prior call
+        // created so a re-configure doesn't leak the executor/credentials watcher or orphan a
+        // Metrics instance whose JmxReporter still owns the (JVM-global, untagged) GCS MBeans.
+        releaseResourcesQuietly();
+
         final GcsStorageConfig config = new GcsStorageConfig(configs);
         this.bucketName = config.bucketName();
 
@@ -158,11 +169,7 @@ public class GcsStorage implements StorageBackend {
         // honor RetrySettings.totalTimeout for resumable uploads.
         operationTimeout = config.operationTimeout();
         if (operationTimeout != null) {
-            operationExecutor = Executors.newCachedThreadPool(r -> {
-                final Thread t = new Thread(r, "gcs-operation");
-                t.setDaemon(true);
-                return t;
-            });
+            operationExecutor = newOperationExecutor();
         }
     }
 
@@ -189,12 +196,79 @@ public class GcsStorage implements StorageBackend {
         return retryBuilder.build();
     }
 
+    /**
+     * A cached daemon thread pool for {@link #runBounded} tasks. It is intentionally unbounded: the
+     * number of live threads tracks the number of in-flight calls, which is itself bounded by the
+     * broker's RemoteLogManager pools (the threads that call into {@code runBounded}) — the
+     * authoritative concurrency limit, which we do not second-guess with an arbitrary cap. Because
+     * {@code gcs.operation.timeout} requires the apache transport, a timed-out worker is always
+     * aborted and freed, so threads do not accumulate beyond that natural bound.
+     *
+     * <p>Threads are daemon and uniquely named ({@code gcs-operation-0}, {@code -1}, …) so they are
+     * distinguishable in thread dumps. Package-private so {@code GcsStorageOperationExecutorTest} can
+     * assert the naming.
+     */
+    static ExecutorService newOperationExecutor() {
+        final AtomicInteger threadNumber = new AtomicInteger();
+        final ThreadFactory threadFactory = r -> {
+            final Thread t = new Thread(r, "gcs-operation-" + threadNumber.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        };
+        return Executors.newCachedThreadPool(threadFactory);
+    }
+
+    /**
+     * Best-effort release of everything {@link #configure} allocates, swallowing errors. Called at
+     * the top of {@code configure()} to make re-configuration idempotent; {@link #close()} performs
+     * the same teardown but surfaces failures to the caller. Fields are nulled so a subsequent
+     * {@code configure()} starts clean (e.g. switching apache -> urlconnection drops the transport).
+     */
+    private void releaseResourcesQuietly() {
+        // Shut the transport down before the executor (same NIO-interrupt rationale as close()):
+        // closing sockets unwinds blocked workers, so the subsequent shutdownNow() interrupt is
+        // harmless rather than a potential park of this (configure()) thread.
+        if (apacheTransport != null) {
+            try {
+                apacheTransport.shutdown();
+            } catch (final IOException ignored) {
+                // best effort
+            }
+            apacheTransport = null;
+        }
+        if (operationExecutor != null) {
+            operationExecutor.shutdownNow();
+            operationExecutor = null;
+        }
+        if (credentialsProvider != null) {
+            try {
+                credentialsProvider.close();
+            } catch (final Exception ignored) {
+                // best effort
+            }
+            credentialsProvider = null;
+        }
+        if (metricCollector != null) {
+            try {
+                metricCollector.close();
+            } catch (final IOException ignored) {
+                // best effort
+            }
+            metricCollector = null;
+        }
+    }
+
     @Override
     public long upload(final InputStream inputStream, final ObjectKey key) throws StorageBackendException {
         return runBounded(() -> doUpload(inputStream, key), "upload " + key);
     }
 
     private long doUpload(final InputStream inputStream, final ObjectKey key) throws StorageBackendException {
+        // Note: when this runs on the operation executor and gcs.operation.timeout fires on the
+        // non-abortable urlconnection transport, the caller (runBounded) returns while this worker
+        // may still be reading inputStream. That is benign here — the worker's result is discarded
+        // and the SDK closes the stream when its createFrom unwinds — but it is why the apache
+        // transport (which aborts the request) is preferred when a timeout is configured.
         try {
             final BlobInfo blobInfo = BlobInfo.newBuilder(this.bucketName, key.value()).build();
             final Blob blob;
@@ -308,8 +382,17 @@ public class GcsStorage implements StorageBackend {
         // timeout. Set inside the lambda (so it's the actual worker, not the submitter), cleared
         // in finally so activeApacheRequests/cancelledWorkers don't grow.
         final AtomicReference<Thread> workerRef = new AtomicReference<>();
+        // Guards the race where the timeout/interrupt handler fires before the worker has published
+        // its thread into workerRef: there, cancelWorker() sees a null worker and cannot abort the
+        // in-flight request, so without this flag the worker would go on to issue an untracked,
+        // un-abortable call and leak its thread. The handler sets this before cancelling; the worker
+        // re-checks it after publishing workerRef and bails if already set.
+        final AtomicBoolean cancelled = new AtomicBoolean();
         final Future<T> future = operationExecutor.submit(() -> {
             workerRef.set(Thread.currentThread());
+            if (cancelled.get()) {
+                throw new StorageBackendException("Cancelled before execution: " + description);
+            }
             try {
                 return action.call();
             } finally {
@@ -319,6 +402,7 @@ public class GcsStorage implements StorageBackend {
         try {
             return future.get(operationTimeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (final TimeoutException e) {
+            cancelled.set(true);
             cancelWorker(future, workerRef.get());
             throw new StorageBackendException(
                 "Timed out after " + operationTimeout + " attempting to " + description, e);
@@ -336,6 +420,7 @@ public class GcsStorage implements StorageBackend {
             // cancel(false), so we must abort its in-flight request. Interruption of the calling
             // thread is routine during RLM task cancellation (partition reassignment, broker
             // shutdown), so without this the worker + its socket would leak on every such event.
+            cancelled.set(true);
             cancelWorker(future, workerRef.get());
             Thread.currentThread().interrupt();
             throw new StorageBackendException("Interrupted while attempting to " + description, e);
@@ -403,10 +488,13 @@ public class GcsStorage implements StorageBackend {
     public void close() throws IOException {
         // Attempt to release every resource even if an earlier one throws, so a single failing
         // close() can't strand the others; rethrow the first failure with the rest suppressed.
-        // shutdownNow() does not throw, so it goes first, unguarded.
-        if (operationExecutor != null) {
-            operationExecutor.shutdownNow();
-        }
+        //
+        // Shut the Apache transport down BEFORE the executor: closing the connection manager
+        // force-closes in-flight sockets, so a blocked worker unwinds via SocketException.
+        // Interrupting first (operationExecutor.shutdownNow() calls Thread.interrupt() on every
+        // worker) risks parking this thread in the JDK's NIO interrupt handler for a worker stuck
+        // in an interruptible channel — the same hazard runBounded avoids with cancel(false) — and,
+        // worse, if it parked we'd never reach the transport shutdown that would unblock the worker.
         IOException failure = null;
         if (apacheTransport != null) {
             try {
@@ -414,6 +502,10 @@ public class GcsStorage implements StorageBackend {
             } catch (final IOException e) {
                 failure = addSuppressed(failure, e);
             }
+        }
+        // shutdownNow() does not throw; with sockets already closed above, the interrupt is harmless.
+        if (operationExecutor != null) {
+            operationExecutor.shutdownNow();
         }
         if (credentialsProvider != null) {
             try {

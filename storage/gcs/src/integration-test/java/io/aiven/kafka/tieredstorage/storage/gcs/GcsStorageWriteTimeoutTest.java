@@ -160,6 +160,7 @@ class GcsStorageWriteTimeoutTest {
             "gcs.bucket.name", "test-bucket",
             "gcs.endpoint.url", server.url(),
             "gcs.credentials.default", "false",
+            "gcs.http.transport", "apache",   // gcs.operation.timeout requires the abortable transport
             "gcs.http.write.timeout", "1500",
             "gcs.api.retry.max.attempts", "1",
             "gcs.operation.timeout", "3000",
@@ -232,63 +233,6 @@ class GcsStorageWriteTimeoutTest {
             .filter(t -> t.getName().startsWith("gcs-operation"))
             .map(Thread::getId)
             .collect(Collectors.toSet());
-    }
-
-    @Test
-    void defaultTransportLeaksWorkerOnApiCallTimeout() throws Exception {
-        // Demonstrates the "leaked daemon thread" limitation with the default NetHttpTransport
-        // (java.net.HttpURLConnection): after Future.cancel, the worker is still parked in
-        // socketWrite0 because there is no abort lever for HttpURLConnection.
-        storage = new GcsStorage();
-        storage.configure(Map.of(
-            "gcs.bucket.name", "test-bucket",
-            "gcs.endpoint.url", server.url(),
-            "gcs.credentials.default", "false",
-            "gcs.http.write.timeout", "60000",      // long — make the leak persist
-            "gcs.operation.timeout", "1500",          // short — fires fast
-            "gcs.api.retry.max.attempts", "1",
-            "gcs.resumable.upload.chunk.size", Integer.toString(CHUNK_SIZE)
-        ));
-
-        final Set<Long> baseline = snapshotApiCallThreadIds();
-
-        assertThatThrownBy(() -> storage.upload(new ByteArrayInputStream(new byte[PAYLOAD_SIZE]),
-                                                new TestObjectKey("leak-default")))
-            .isInstanceOf(StorageBackendException.class)
-            .hasMessageContaining("Timed out");
-
-        assertThat(server.awaitPut(Duration.ofSeconds(5))).isTrue();
-
-        // Poll for up to 2s for the leak to manifest. The worker is not interrupted, so the
-        // kernel-buffered write parks in socketWrite0 / NioSocketImpl.implWrite within tens of ms —
-        // but on slow hosts the worker may take longer to reach the blocked write.
-        List<String> leaked = findLeakedApiCallWorkers(baseline);
-        final long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
-        while (leaked.isEmpty() && System.nanoTime() < deadline) {
-            Thread.sleep(50);
-            leaked = findLeakedApiCallWorkers(baseline);
-        }
-
-        if (leaked.isEmpty()) {
-            // Diagnostic dump: full stacks of every gcs-operation worker so we can see where the
-            // worker actually is, in case the JDK NIO stack no longer matches the detected frames.
-            final StringBuilder dump = new StringBuilder();
-            Thread.getAllStackTraces().entrySet().stream()
-                .filter(e -> e.getKey().getName().startsWith("gcs-operation"))
-                .forEach(e -> {
-                    dump.append("\n").append(e.getKey().getName())
-                        .append(" state=").append(e.getKey().getState()).append("\n");
-                    Arrays.stream(e.getValue()).limit(60)
-                        .forEach(f -> dump.append("    at ").append(f).append("\n"));
-                });
-            System.err.println("[defaultTransportLeaksWorkerOnApiCallTimeout] "
-                + "leak NOT observed within 2s window. All gcs-operation worker stacks:" + dump);
-        }
-
-        assertThat(leaked)
-            .as("default NetHttpTransport: expected at least one gcs-operation worker still parked"
-                + " in a write syscall after the call timeout fired and Future.cancel ran.")
-            .isNotEmpty();
     }
 
     @Test

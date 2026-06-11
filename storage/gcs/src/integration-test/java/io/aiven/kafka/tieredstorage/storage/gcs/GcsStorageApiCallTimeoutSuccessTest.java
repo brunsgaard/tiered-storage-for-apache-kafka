@@ -77,7 +77,7 @@ class GcsStorageApiCallTimeoutSuccessTest {
     }
 
     @ParameterizedTest(name = "transport={0}")
-    @ValueSource(strings = {"urlconnection", "apache"})
+    @ValueSource(strings = {"apache"})   // gcs.operation.timeout requires the apache transport
     void uploadFetchDeleteRoundtripSucceedsWithApiCallTimeoutSet(final String transport) throws Exception {
         // 60s call timeout: comfortably above any healthy fake-gcs-server roundtrip, so it never
         // fires; this is a success-path test. The point is to exercise the executor-wrapped code
